@@ -47,6 +47,7 @@ def feishu_rows(rows):
             "发布时间": fmt(r.get("created_at")),
             "最近活跃": fmt(r.get("bumped_at")),
             "Topic ID": r.get("id", ""),
+            "标签": r.get("tags") or [],
         })
     return out
 
@@ -121,13 +122,14 @@ def main():
     else:
         rows = feishu_rows(raw)
 
-    # 幂等清洗：帖子链接若是对象则转纯字符串（url 字段应存裸 URL）
+    # 幂等清洗：帖子链接若是对象则转纯字符串（url 字段应存裸 URL）；标签缺失则补空
     cleaned = []
     for r in rows:
         r = dict(r)
         link = r.get("帖子链接")
         if isinstance(link, dict):
             r["帖子链接"] = link.get("link") or link.get("text") or ""
+        r.setdefault("标签", [])
         cleaned.append(r)
     rows = cleaned
 

@@ -382,6 +382,43 @@ def merge_incremental(all_rows):
 
 
 # ---------------------------------------------------------------------------
+# 自动打标
+# ---------------------------------------------------------------------------
+TAG_RULES = [
+    ("AI模型", ["gpt", "claude", "gemini", "大模型", "chatgpt", "deepseek", "qwen", "豆包", "llm", "agent", "模型", "token", "api", "ai", "人工智能", "智能"]),
+    ("教程", ["教程", "怎么", "如何", "指南", "入门", "配置", "安装", "方法"]),
+    ("福利", ["免费", "领取", "白嫖", "福利", "优惠", "活动", "抽奖", "赠送"]),
+    ("薅羊毛", ["羊毛", "白嫖", "薅"]),
+    ("网盘", ["网盘", "阿里云盘", "夸克", "百度网盘"]),
+    ("资源分享", ["资源", "下载", "分享", "合集"]),
+    ("求职", ["求职", "找工作", "offer", "面试", "简历", "跳槽"]),
+    ("招聘", ["招聘", "内推", "招人"]),
+    ("新闻", ["快讯", "发布", "上线", "官宣", "宣布", "推出", "重磅"]),
+    ("工具", ["工具", "脚本", "插件", "软件", "app", "cli", "开源"]),
+    ("求助", ["求助", "帮忙", "求救", "有没有人"]),
+    ("闲聊", ["闲聊", "水帖", "灌水", "大家"]),
+    ("避坑", ["避坑", "注意", "警告", "别", "坑"]),
+]
+
+
+def auto_tags(title):
+    """按标题关键词自动打标，返回标签列表（去重、保序）"""
+    t = (title or "").lower()
+    tags = []
+    for name, kws in TAG_RULES:
+        if any(k.lower() in t for k in kws) and name not in tags:
+            tags.append(name)
+    return tags
+
+
+def tag_topic(topic):
+    """给单条 topic 记录补 tags 字段"""
+    topic = dict(topic)
+    topic["tags"] = auto_tags(topic.get("title", ""))
+    return topic
+
+
+# ---------------------------------------------------------------------------
 # 输出：飞书多维表格插入 JSON（每行一个 topic 记录）
 # ---------------------------------------------------------------------------
 def feishu_rows(rows):
@@ -413,6 +450,7 @@ def feishu_rows(rows):
             "发布时间": fmt(created),
             "最近活跃": fmt(bumped),
             "Topic ID": r.get("id", ""),
+            "标签": r.get("tags") or [],
         })
     return out
 
@@ -478,6 +516,11 @@ def main():
             max_pages = 3
         result = scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
         all_rows = flatten(result)
+
+        # 自动打标
+        for row in all_rows:
+            row["tags"] = auto_tags(row.get("title", ""))
+        log(f"打标完成（含标签的帖子: {sum(1 for r in all_rows if r['tags'])}/{len(all_rows)}）")
 
         log(f"共抓取 {len(all_rows)} 条帖子")
 
