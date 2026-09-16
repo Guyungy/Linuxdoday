@@ -40,7 +40,7 @@ from xml.etree import ElementTree
 # 配置
 # ---------------------------------------------------------------------------
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
+PROXY_DEFAULT = "127.0.0.1:7897"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
 BROWSER_DATA = os.path.join(os.getcwd(), "browser_data")

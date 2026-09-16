@@ -20,24 +20,103 @@ import urllib.error
 from datetime import datetime, date
 
 # Linux 输入法兼容性修复（必须在导入 tkinter 之前设置）
+import platform
+
+if platform.system() == "Linux":
+    # 尝试检测并设置输入法环境变量
+    if "GTK_IM_MODULE" not in os.environ:
+        # 检测 fcitx
+        if os.path.exists("/usr/bin/fcitx") or os.path.exists("/usr/bin/fcitx5"):
+            os.environ["GTK_IM_MODULE"] = "fcitx"
+            os.environ["QT_IM_MODULE"] = "fcitx"
+            os.environ["XMODIFIERS"] = "@im=fcitx"
+        # 检测 ibus
+        elif os.path.exists("/usr/bin/ibus"):
+            os.environ["GTK_IM_MODULE"] = "ibus"
+            os.environ["QT_IM_MODULE"] = "ibus"
+            os.environ["XMODIFIERS"] = "@im=ibus"
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
-from mac_utils import browser_data_dir, chrome_path
 
 # 版本信息
 VERSION = "8.5.0"
-GITHUB_REPO = "Guyungy/Linuxdoday"
+GITHUB_REPO = "icysaintdx/linuxdosss"
 
-# macOS 原生字体；托盘功能不适用，保持禁用。
-FONT_FAMILY = "PingFang SC"
-FONT_MONO = "Menlo"
+# 跨平台字体配置
+import platform
+
+if platform.system() == "Darwin":  # macOS
+    FONT_FAMILY = "PingFang SC"
+    FONT_MONO = "Menlo"
+elif platform.system() == "Linux":
+    FONT_FAMILY = "Noto Sans CJK SC"
+    FONT_MONO = "Monospace"
+else:  # Windows
+    FONT_FAMILY = "Microsoft YaHei UI"
+    FONT_MONO = "Consolas"
+
+# 托盘支持（macOS 上禁用，因为可能导致 UI 问题）
 TRAY_SUPPORT = False
+if platform.system() != "Darwin":  # 非 macOS
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+
+        TRAY_SUPPORT = True
+    except ImportError:
+        TRAY_SUPPORT = False
+else:
+    # macOS 上尝试导入 PIL（用于其他功能），但禁用托盘
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        pass
 
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
 except:
     print("pip install DrissionPage")
     sys.exit(1)
+
+
+def get_icon_path():
+    """获取图标路径"""
+    if getattr(sys, "frozen", False):
+        # 打包后的路径
+        base_path = sys._MEIPASS
+    else:
+        # 开发环境路径
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, "icon.ico")
+
+
+def create_tray_image(color="#0f3460"):
+    """创建托盘图标图像"""
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # 背景圆形
+    padding = 4
+    draw.ellipse([padding, padding, size - padding, size - padding], fill=color)
+
+    # 内圈
+    inner_padding = 12
+    draw.ellipse(
+        [inner_padding, inner_padding, size - inner_padding, size - inner_padding],
+        fill="#1a1a2e",
+    )
+
+    # 中心点
+    center = size // 2
+    dot_size = 8
+    draw.ellipse(
+        [center - dot_size, center - dot_size, center + dot_size, center + dot_size],
+        fill="#00d9ff",
+    )
+
+    return img
 
 
 # 板块配置
@@ -61,7 +140,7 @@ CATS = [
 ]
 
 CFG = {
-    "proxy": os.environ.get("LINUXDO_PROXY", ""),
+    "proxy": "127.0.0.1:7897",
     "base": "https://linux.do",
     "connect": "https://connect.linux.do",
     "like_rate": 0.3,
@@ -211,16 +290,8 @@ class Bot:
                 co = ChromiumOptions()
 
                 # 设置用户数据目录
-                user_data_dir = browser_data_dir()
+                user_data_dir = os.path.join(os.getcwd(), "browser_data")
                 co.set_user_data_path(user_data_dir)
-
-                executable = chrome_path()
-                if not executable:
-                    raise RuntimeError(
-                        "未找到 Google Chrome，请安装到 /Applications，"
-                        "或设置 LINUXDO_CHROME_PATH"
-                    )
-                co.set_browser_path(executable)
 
                 if s.cfg["proxy"]:
                     co.set_proxy(s.cfg["proxy"])
@@ -1352,6 +1423,14 @@ class GUI:
         s.rt.geometry("700x950")
         s.rt.minsize(650, 850)  # 设置最小窗口大小
         s.rt.configure(bg="#1a1a2e")
+
+        # 设置窗口图标
+        try:
+            icon_path = get_icon_path()
+            if os.path.exists(icon_path):
+                s.rt.iconbitmap(icon_path)
+        except:
+            pass
 
         # 不使用overrideredirect，保留系统标题栏以支持窗口拉伸
         # s.rt.overrideredirect(True)  # 移除默认标题栏

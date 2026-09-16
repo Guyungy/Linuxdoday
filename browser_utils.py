@@ -22,11 +22,10 @@ import time
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright
-from mac_utils import browser_data_dir, chrome_path
 
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
-USER_DATA_DIR = browser_data_dir()
+PROXY_DEFAULT = "127.0.0.1:7897"
+USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
 
 
 def log(msg):
@@ -61,16 +60,9 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False):
     """
     kill_stale_chrome()
     p = sync_playwright().start()
-    executable = chrome_path()
-    if not executable:
-        p.stop()
-        raise RuntimeError(
-            "未找到 Google Chrome。请安装到 /Applications，"
-            "或设置 LINUXDO_CHROME_PATH。"
-        )
     ctx = p.chromium.launch_persistent_context(
         user_data_dir=USER_DATA_DIR,
-        executable_path=executable,
+        channel="chrome",          # 用系统已装的 Google Chrome（非 bundled chromium）
         headless=headless,
         proxy={"server": f"http://{proxy}"} if proxy else None,
         args=["--disable-blink-features=AutomationControlled"],

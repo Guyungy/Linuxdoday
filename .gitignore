@@ -18,6 +18,10 @@ wheels/
 .installed.cfg
 *.egg
 
+# PyInstaller
+*.manifest
+*.spec
+
 # Logs
 *.log
 
@@ -53,13 +57,8 @@ linux_do_topic*.py
 linux_do_gui_part*.py
 LDStatusPro/
 
-# Local macOS virtual environment
-.venv/
-
-# macOS application build output
-build/
+# Dist folder (exe files are too large for git)
 dist/
-*.spec
 
 # WorkBuddy workspace memory
 .workbuddy/
