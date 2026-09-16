@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    SERVICE_PORT=8080
+
+WORKDIR /app
+
+COPY requirements-service.txt ./
+RUN pip install --no-cache-dir -r requirements-service.txt \
+    && useradd --create-home --uid 10001 linuxdoday \
+    && mkdir -p /app/data \
+    && chown -R linuxdoday:linuxdoday /app
+
+COPY --chown=linuxdoday:linuxdoday service.py linux_do_scraper.py fetch_content.py ./
+
+USER linuxdoday
+EXPOSE 8080
+VOLUME ["/app/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+
+CMD ["python", "service.py"]

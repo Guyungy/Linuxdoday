@@ -24,7 +24,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 BASE = "https://linux.do"
-PROXY_DEFAULT = "127.0.0.1:7897"
+PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
 
 

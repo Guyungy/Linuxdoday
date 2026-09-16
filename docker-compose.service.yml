@@ -1,0 +1,21 @@
+services:
+  linuxdoday:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVICE_PORT: "8080"
+      SCRAPE_INTERVAL_SECONDS: "21600"
+      RUN_ON_START: "true"
+      SCRAPE_CONTENT: "false"
+      SERVICE_TOKEN: "${SERVICE_TOKEN:-}"
+      # SCRAPE_CATEGORIES: "开发调优,前沿快讯"
+      # LINUXDO_PROXY: "http://host.docker.internal:7897"
+    volumes:
+      - linuxdoday-data:/app/data
+
+volumes:
+  linuxdoday-data:

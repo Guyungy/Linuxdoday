@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+__pycache__
+browser_data
+build
+dist
+data
+*.pyc
+*.log
+*.ndjson
