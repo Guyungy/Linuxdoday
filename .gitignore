@@ -57,3 +57,6 @@ LDStatusPro/
 
 # Dist folder (exe files are too large for git)
 dist/
+
+# WorkBuddy workspace memory
+.workbuddy/
