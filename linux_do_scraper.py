@@ -182,9 +182,15 @@ def scrape_all_rss(cats, limit=0, proxy=None):
     result = {}
     for cat in cats:
         log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
-        result[cat["n"]] = scrape_category_rss(cat, limit=limit, proxy=proxy)
+        try:
+            result[cat["n"]] = scrape_category_rss(cat, limit=limit, proxy=proxy)
+        except Exception as exc:
+            # 单个板块被限流或暂时失败时保留其他板块结果，
+            # 避免长时间定时任务因一个 HTTP 429 整体丢失。
+            log(f"  ⚠️ 板块[{cat['n']}] 抓取失败，继续下一个: {exc}")
+            result[cat["n"]] = []
         log(f"  → 板块[{cat['n']}] 共 {len(result[cat['n']])} 条")
-        time.sleep(random.uniform(2, 4))
+        time.sleep(random.uniform(4, 7))
     return result
 
 
