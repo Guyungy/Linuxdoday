@@ -6,8 +6,7 @@ fetch_content.py — 抓取 Linux.do 帖子正文（全量回填/增量补全）
 为什么独立成脚本：
   - 正文抓取是"每条一请求"，与列表抓取节奏完全不同，放主 scraper 会拖慢每日增量
   - 支持全量回填历史（--all），也支持只补没有正文的（默认）
-  - 正文存本地 data/topic_content.json（{topic_id: {content, excerpt, fetched_at}}），
-    不直接写入多维表格（正文太长会撑爆表），需要时可用 fetch_content 的 --feishu 导出短摘要
+  - 正文存本地 data/topic_content.json（{topic_id: {content, fetched_at}}）
 
 用法：
   python fetch_content.py                 # 只补缓存里没有正文的帖子（增量）
@@ -101,14 +100,8 @@ def strip_html(html):
     return text.strip()
 
 
-def make_excerpt(text, limit=300):
-    if not text:
-        return ""
-    return text[:limit] + ("…" if len(text) > limit else "")
-
-
 def fetch_content(pg, row):
-    """抓取单帖正文。返回 {content, excerpt} 或 None"""
+    """抓取单帖正文。返回正文数据或 None。"""
     slug, tid = make_slug(row)
     data = pg.evaluate("""
     async (args) => {
@@ -141,7 +134,6 @@ def fetch_content(pg, row):
         content = strip_html(content)
     return {
         "content": content,
-        "excerpt": make_excerpt(content),
         "author_raw": p0.get("username") or "",
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
     }

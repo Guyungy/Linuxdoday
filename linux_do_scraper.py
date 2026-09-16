@@ -554,7 +554,6 @@ def feishu_rows(rows):
             "Topic ID": r.get("id", ""),
             "标签": r.get("tags") or [],
             "正文": r.get("content", ""),
-            "摘要": r.get("excerpt", ""),
         })
     return out
 
@@ -653,7 +652,6 @@ def main():
             content = rss_contents.get(str(row.get("id")), "")
             if content:
                 row["content"] = content
-                row["excerpt"] = content[:300] + ("…" if len(content) > 300 else "")
 
         # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json，不进飞书表）
         if args.content and new_rows:
@@ -664,15 +662,14 @@ def main():
                 for row in new_rows:
                     if args.rss and str(row.get("id")) in rss_contents:
                         content = rss_contents[str(row.get("id"))]
-                        res = {"content": content, "excerpt": content[:300] + ("…" if len(content) > 300 else ""),
-                               "author_raw": row.get("author", ""), "fetched_at": datetime.now().isoformat(timespec="seconds")}
+                        res = {"content": content, "author_raw": row.get("author", ""),
+                               "fetched_at": datetime.now().isoformat(timespec="seconds")}
                     else:
                         time.sleep(random.uniform(2, 4))
                         res = _fc(pg, row)
                     if res:
                         contents[str(row.get("id"))] = res
                         row["content"] = res.get("content", "")
-                        row["excerpt"] = res.get("excerpt", "")
                         got += 1
                 _sj(CONTENT_FILE, contents)
                 log(f"新帖正文: 抓取 {got}/{len(new_rows)} 条 → {CONTENT_FILE}")

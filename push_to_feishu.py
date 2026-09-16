@@ -54,7 +54,6 @@ def feishu_rows(rows):
             "Topic ID": r.get("id", ""),
             "标签": r.get("tags") or [],
             "正文": r.get("content", ""),
-            "摘要": r.get("excerpt", ""),
         })
     return out
 
