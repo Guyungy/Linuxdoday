@@ -20,7 +20,7 @@ python linux_do_scraper.py --browse
 python linux_do_scraper.py --scrape 2>/dev/null | python push_to_feishu.py
 
 # 无浏览器轻量模式（每板块最新约25条，无浏览量/回复数）
-python linux_do_scraper.py --scrape --rss 2>/dev/null | python push_to_feishu.py
+python linux_do_scraper.py --scrape --rss --no-proxy 2>/dev/null | python push_to_feishu.py
 
 # 3. 常用变体
 python linux_do_scraper.py --scrape --cats 开发调优,前沿快讯   # 指定板块
@@ -52,4 +52,5 @@ python push_to_feishu.py --dry-run                             # 只看不写
 
 - 登录态保存在 `browser_data/`（含 cookie），别提交到 git
 - 防风控：抓取带随机延迟，别频繁跑
+- macOS 默认不使用代理；如需代理可设置 `LINUXDO_PROXY=127.0.0.1:7897`
 - 板块配置与 `linux_do_gui.py` 一致；`--full` 会抓上万条，慎用
