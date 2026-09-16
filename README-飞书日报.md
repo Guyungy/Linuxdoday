@@ -41,7 +41,7 @@ python push_to_feishu.py --dry-run                             # 只看不写
 
 - Base：**Linux.do 帖子日报**（token `LYdZbR3DTaFPeYsHP8ScqPVCnFe`）
 - 表：**帖子主题**
-- 字段：标题(text) / 帖子链接(url) / 作者(text) / 板块(text) / 回复数(number) / 浏览量(number) / 发布时间(datetime) / 最近活跃(datetime) / Topic ID(text) / 入库时间(created_at)
+- 字段：标题(text) / 帖子链接(url) / 作者(text) / 板块(text) / 回复数(number) / 浏览量(number) / 发布时间(datetime) / 最近活跃(datetime) / Topic ID(text) / 标签(select) / 正文(text) / 摘要(text) / 入库时间(created_at)
 
 ## 定时运行（可选，日报数据源）
 

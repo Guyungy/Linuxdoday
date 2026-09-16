@@ -553,6 +553,8 @@ def feishu_rows(rows):
             "最近活跃": fmt(bumped),
             "Topic ID": r.get("id", ""),
             "标签": r.get("tags") or [],
+            "正文": r.get("content", ""),
+            "摘要": r.get("excerpt", ""),
         })
     return out
 
@@ -646,6 +648,13 @@ def main():
         new_rows, merged = merge_incremental(all_rows)
         log(f"本地缓存: 新增 {len(new_rows)} 条，累计 {len(merged)} 条 → {CACHE_FILE}")
 
+        # RSS 本身已包含首帖正文；仅附加到本次输出，避免正文撑大主题缓存。
+        for row in new_rows:
+            content = rss_contents.get(str(row.get("id")), "")
+            if content:
+                row["content"] = content
+                row["excerpt"] = content[:300] + ("…" if len(content) > 300 else "")
+
         # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json，不进飞书表）
         if args.content and new_rows:
             try:
@@ -662,6 +671,8 @@ def main():
                         res = _fc(pg, row)
                     if res:
                         contents[str(row.get("id"))] = res
+                        row["content"] = res.get("content", "")
+                        row["excerpt"] = res.get("excerpt", "")
                         got += 1
                 _sj(CONTENT_FILE, contents)
                 log(f"新帖正文: 抓取 {got}/{len(new_rows)} 条 → {CONTENT_FILE}")

@@ -53,6 +53,8 @@ def feishu_rows(rows):
             "最近活跃": fmt(r.get("bumped_at")),
             "Topic ID": r.get("id", ""),
             "标签": r.get("tags") or [],
+            "正文": r.get("content", ""),
+            "摘要": r.get("excerpt", ""),
         })
     return out
 
