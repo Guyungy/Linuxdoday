@@ -27,6 +27,11 @@ DEFAULT_BASE_TOKEN = "LYdZbR3DTaFPeYsHP8ScqPVCnFe"
 DEFAULT_TABLE = "帖子主题"
 BATCH = 200  # lark-cli 单次最大 200
 
+# 关键：必须用创建该 Base 的 app profile（claw / cli_aa0112b836bf5be2）。
+# 默认 active profile 是 huidu（cli_aa20b02703b99d18），对这张表无权限（91403）。
+# 命名 profile 见 ~/.lark-cli/config.json（config init --name claw）。
+LARK_PROFILE = "claw"
+
 
 def feishu_rows(rows):
     """topic 原始记录 → 飞书字段格式"""
@@ -61,8 +66,55 @@ def load_from_file(path):
         return json.load(f)
 
 
+def existing_topic_ids(base_token, table):
+    """查询飞书表中已存在的 Topic ID 集合（幂等去重用）"""
+    ids = set()
+    offset = 0
+    while True:
+        cmd = [
+            "lark-cli", "--profile", LARK_PROFILE, "base", "+record-list",
+            "--base-token", base_token,
+            "--table-id", table,
+            "--field-id", "Topic ID",
+            "--offset", str(offset),
+            "--limit", "200",
+            "--format", "json",
+            "--as", "user",
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                print(f"  ⚠️ 查询已有 Topic ID 失败: {r.stderr[:300]}", file=sys.stderr)
+                return None
+            d = json.loads(r.stdout)
+            rows = (d.get("data") or {}).get("data") or []
+            for row in rows:
+                # json 矩阵：每行 [[value]]（单字段投影）或 [["a","b"]]（多字段）
+                cell = row[0] if row else None
+                if isinstance(cell, list):
+                    cell = cell[0] if cell else None
+                if cell is not None:
+                    ids.add(str(cell))
+        except Exception as e:
+            print(f"  ⚠️ 查询已有 Topic ID 异常: {e}", file=sys.stderr)
+            return None
+        if len(rows) < 200:
+            break
+        offset += len(rows)
+    return ids
+
+
+def dedupe_against_feishu(base_token, table, rows):
+    """按 Topic ID 剔除飞书表中已存在的行（幂等双保险）"""
+    ids = existing_topic_ids(base_token, table)
+    if ids is None:
+        return rows, 0
+    kept = [r for r in rows if str(r.get("Topic ID", "")) not in ids]
+    skipped = len(rows) - len(kept)
+    return kept, skipped
+
+
 def push(base_token, table, rows, dry_run=False):
-    """分批写入飞书"""
     total = len(rows)
     if total == 0:
         print("无待写入记录")
@@ -73,7 +125,7 @@ def push(base_token, table, rows, dry_run=False):
         chunk = rows[i:i + BATCH]
         payload = json.dumps({"create_records": chunk}, ensure_ascii=False)
         cmd = [
-            "lark-cli", "base", "+record-batch-create",
+            "lark-cli", "--profile", LARK_PROFILE, "base", "+record-batch-create",
             "--base-token", base_token,
             "--table-id", table,
             "--json", payload,
@@ -137,6 +189,14 @@ def main():
         print(f"[dry-run] 将写入 {len(rows)} 条到 [{args.table}]")
         if rows:
             print("样例:", json.dumps(rows[0], ensure_ascii=False)[:300])
+        return
+
+    # 幂等双保险：剔除飞书表中已存在的 Topic ID（防止本地缓存丢失/误删导致重复入库）
+    rows, skipped = dedupe_against_feishu(args.base_token, args.table, rows)
+    if skipped:
+        print(f"已跳过 {skipped} 条已入库记录（按 Topic ID 去重）")
+    if not rows:
+        print("无新增记录")
         return
 
     push(args.base_token, args.table, rows)

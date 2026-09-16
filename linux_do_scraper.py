@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-linux_do_scraper.py — Linux.do 帖子数据抓取器（DrissionPage 真实浏览器版）
+linux_do_scraper.py — Linux.do 帖子数据抓取器
 
 用途：
   为「帖子日报仪表盘」抓取全板块帖子数据。
-  绕过 Cloudflare Turnstile 托管挑战：必须用真实 Chrome（DrissionPage 控制），
-  纯 HTTP 库（requests / curl_cffi / cloudscraper）全部 403。
+  近期帖子可通过 RSS 无浏览器抓取；全量数据和浏览/回复指标仍使用
+  Playwright 真实 Chrome 访问受 Cloudflare 保护的 Discourse JSON 接口。
+  注：DrissionPage 4.x 与 Chrome 153 不兼容（WebSocket 404），已弃用。
 
 流程：
   1) python linux_do_scraper.py --browse    # 首次：打开浏览器，人工登录，等待登录成功后退出
@@ -20,6 +21,7 @@ linux_do_scraper.py — Linux.do 帖子数据抓取器（DrissionPage 真实浏�
   python linux_do_scraper.py --scrape --limit 50          # 每板块最多 50 条
   python linux_do_scraper.py --scrape --no-proxy          # 不走代理
   python linux_do_scraper.py --scrape --json-only         # 只输出飞书插入 JSON，不落盘
+  python linux_do_scraper.py --scrape --rss               # 无浏览器，每板块最新约 25 条
 """
 
 import argparse
@@ -30,8 +32,9 @@ import sys
 import time
 import random
 from datetime import datetime
-
-from DrissionPage import ChromiumOptions, ChromiumPage
+from email.utils import parsedate_to_datetime
+from html import unescape
+from xml.etree import ElementTree
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -72,11 +75,11 @@ def log(msg):
 # 浏览器
 # ---------------------------------------------------------------------------
 def kill_stale_chrome():
-    """清理上次退出残留的 DrissionPage Chrome（占用 9222 调试端口会致新实例 WS 404）"""
+    """清理残留 Chrome：以 browser_data 为 user-data-dir 的实例会锁 profile"""
     import subprocess
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "remote-debugging-port=9222"],
+            ["pgrep", "-f", "browser_data"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         if out:
@@ -92,47 +95,97 @@ def kill_stale_chrome():
 
 
 def start_browser(proxy=None, headless=False):
-    """启动真实 Chrome（复用项目现有启动方式）"""
-    kill_stale_chrome()
-    co = ChromiumOptions()
-    co.set_user_data_path(BROWSER_DATA)
-    if proxy:
-        co.set_proxy(proxy)
-    co.set_argument("--disable-blink-features=AutomationControlled")
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    if headless:
-        co.set_argument("--headless=new")
-    co.set_argument("--window-size=1920,1080")
-    pg = ChromiumPage(co)
-    return pg
+    """启动 playwright 持久化上下文（复用 browser_data 登录态）。
+
+    返回 (ctx, page)。调用方用完必须 ctx.close()。
+    headless=True 会被 Cloudflare 拦截，默认 False。
+    """
+    from browser_utils import start_browser as start_browser_pw
+    return start_browser_pw(proxy=proxy, headless=headless)
 
 
-def wait_cf_challenge(pg, url, timeout=60):
-    """等待 Cloudflare 托管挑战完成（页面 title 不再含 'Just a moment'）"""
-    pg.get(url)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        title = ""
-        try:
-            title = pg.title or ""
-        except Exception:
-            pass
-        if "Just a moment" not in title and "Attention Required" not in title:
-            return True
-        time.sleep(2)
-    log(f"⚠️ Cloudflare 挑战超时（{timeout}s），当前 title: {pg.title}")
-    return False
+def check_login(page):
+    from browser_utils import check_login as _check_login
+    return _check_login(page)
 
 
-def check_login(pg):
-    """检查是否已登录（存在 #current-user 元素）"""
+def wait_cf_challenge(page, url, timeout=60):
+    from browser_utils import wait_cf_challenge as _wait_cf_challenge
+    return _wait_cf_challenge(page, url, timeout=timeout)
+
+
+def _plain_text(html):
+    """将 RSS description 中的 HTML 转成简单纯文本。"""
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def scrape_category_rss(cat, limit=0, proxy=None, retries=3):
+    """无浏览器抓取板块 RSS。
+
+    RSS 通常只包含最新 25 条，没有浏览量和回复数，但包含首帖正文。
+    """
     try:
-        pg.get(BASE)
-        time.sleep(3)
-        return pg.ele("#current-user", timeout=8) is not None
-    except Exception:
-        return False
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
+
+    url = BASE + cat["u"].rstrip("/") + ".rss"
+    kwargs = {"impersonate": "chrome", "timeout": 30}
+    if proxy:
+        kwargs["proxy"] = proxy if "://" in proxy else f"http://{proxy}"
+    response = None
+    for attempt in range(1, retries + 1):
+        response = curl_requests.get(url, **kwargs)
+        if response.status_code == 200:
+            break
+        if attempt < retries:
+            delay = attempt * 5
+            log(f"  RSS HTTP {response.status_code}，{delay}s 后重试 ({attempt}/{retries})")
+            time.sleep(delay)
+    if response is None or response.status_code != 200:
+        raise RuntimeError(f"RSS 请求失败: HTTP {response.status_code if response else 'unknown'}")
+
+    root = ElementTree.fromstring(response.content)
+    dc_creator = "{http://purl.org/dc/elements/1.1/}creator"
+    discourse = "{http://www.discourse.org/}"
+    topics = []
+    for item in root.findall("./channel/item"):
+        link = (item.findtext("link") or "").strip()
+        match = re.search(r"/t/(?:[^/]+/)?(\d+)(?:/|$)", link)
+        if not match:
+            continue
+        tid = match.group(1)
+        pub_date = (item.findtext("pubDate") or "").strip()
+        try:
+            created_at = parsedate_to_datetime(pub_date).isoformat()
+        except (TypeError, ValueError):
+            created_at = pub_date
+        content = _plain_text(item.findtext("description") or "")
+        topics.append({
+            "id": tid, "title": (item.findtext("title") or "").strip()[:200],
+            "url": link.removeprefix(BASE), "replies": 0, "views": 0,
+            "author": (item.findtext(dc_creator) or "").strip(),
+            "created_at": created_at, "bumped_at": created_at, "slug": "",
+            "like_count": 0, "posts_count": 0,
+            "pinned": (item.findtext(discourse + "topicPinned") or "").lower() == "yes",
+            "archived": (item.findtext(discourse + "topicArchived") or "").lower() == "yes",
+            "closed": (item.findtext(discourse + "topicClosed") or "").lower() == "yes",
+            "visible": True, "tags_raw": [], "_rss_content": content, "_rss_source": True,
+        })
+        if limit and len(topics) >= limit:
+            break
+    return topics
+
+
+def scrape_all_rss(cats, limit=0, proxy=None):
+    result = {}
+    for cat in cats:
+        log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
+        result[cat["n"]] = scrape_category_rss(cat, limit=limit, proxy=proxy)
+        log(f"  → 板块[{cat['n']}] 共 {len(result[cat['n']])} 条")
+        time.sleep(random.uniform(2, 4))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -154,17 +207,17 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
         time.sleep(random.uniform(*page_delay))
 
         # 浏览器内 fetch 同源 JSON（带 cookie 绕过 CF）
-        data = pg.run_js("""
-        async function fetchPage() {
+        data = pg.evaluate("""
+        async (args) => {
+            const {slug, page} = args;
             try {
-                const url = "/c/%s.json?page=%d";
+                const url = "/c/" + slug + ".json?page=" + page;
                 const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}});
                 if (!r.ok) return {error: "HTTP " + r.status};
                 return await r.json();
             } catch(e) { return {error: String(e)}; }
         }
-        return fetchPage();
-        """ % (slug, page_num - 1))
+        """, {"slug": slug, "page": page_num - 1})
 
         if not data or data.get("error"):
             log(f"  板块[{cat['n']}] JSON 失败({data.get('error') if data else '空'})，回退 DOM 解析")
@@ -184,16 +237,20 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
             # 作者：posters[0].username（原帖人）
             author = ""
             posters = t.get("posters") or []
+            # user_id -> username 反查表（新版 Discourse posters 常只有 user_id）
+            user_map = {u.get("id"): (u.get("username") or "") for u in (data.get("users") or [])}
             if posters:
                 pu = posters[0].get("username") or ""
                 if not pu:
-                    # 有时 posters 只给 user_id，从 users 数组反查
-                    uid = posters[0].get("user_id")
-                    for u in data.get("users") or []:
-                        if u.get("id") == uid:
-                            pu = u.get("username") or ""
-                            break
+                    pu = user_map.get(posters[0].get("user_id")) or ""
                 author = pu
+            # 保留 Discourse JSON 全部原始字段（额外信息：slug/点赞/回复帖数/原生标签/最后活跃者等）
+            raw_tags = [x for x in (t.get("tags") or []) if isinstance(x, str)]
+            last_poster = ""
+            if posters:
+                last_poster = posters[-1].get("username") or ""
+                if not last_poster and len(posters) > 1:
+                    last_poster = user_map.get(posters[-1].get("user_id")) or ""
             topics.append({
                 "id": tid,
                 "title": (t.get("title") or "")[:200],
@@ -203,6 +260,20 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
                 "author": author,
                 "created_at": t.get("created_at") or "",
                 "bumped_at": t.get("bumped_at") or "",
+                # —— 以下为补充保留字段（用于防重/去重与数据丰富）——
+                "slug": t.get("slug") or "",
+                "like_count": int(t.get("like_count") or 0),
+                "posts_count": int(t.get("posts_count") or t.get("reply_count") or 0),
+                "posters": [user_map.get(p.get("user_id")) or p.get("username") or "" for p in posters],
+                "last_poster": last_poster,
+                "category_id": t.get("category_id") or "",
+                "pinned": bool(t.get("pinned")),
+                "archived": bool(t.get("archived")),
+                "closed": bool(t.get("closed")),
+                "visible": bool(t.get("visible")),
+                "tags_raw": raw_tags,
+                "image_url": t.get("image_url") or "",
+                "thumbnails": t.get("thumbnails") or None,
             })
             fresh += 1
         log(f"  板块[{cat['n']}] 第{page_num}页: JSON 抓取 {len(topic_list)} 条，新增 {fresh} 条（累计 {len(topics)}）")
@@ -234,8 +305,8 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
         time.sleep(random.uniform(*page_delay))
 
         # 用 JS 抓当前页列表（从每行 DOM 直接取字段，不依赖预加载 JSON）
-        page_topics = pg.run_js("""
-        function scrapePage() {
+        page_topics = pg.evaluate("""
+        () => {
             const rows = document.querySelectorAll('tr.topic-list-item');
             const out = [];
             rows.forEach(row => {
@@ -326,11 +397,11 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
 
         # 尝试点击"下一页"（Discourse 列表分页是 a[rel='next']）
         try:
-            next_btn = pg.ele("a[rel='next']", timeout=2)
-            if not next_btn:
+            if pg.locator("a[rel='next']").count() > 0:
+                pg.locator("a[rel='next']").first.click(timeout=3000)
+                time.sleep(2)
+            else:
                 break
-            next_btn.click()
-            time.sleep(2)
         except Exception:
             break
 
@@ -361,7 +432,12 @@ def flatten(result):
 
 
 def merge_incremental(all_rows):
-    """与本地缓存合并（按 topic id 去重，新的优先），返回 (新增, 全部)"""
+    """与本地缓存合并（按 topic id 去重，字段取并集，新值优先）。
+
+    同 ID 记录不会整体覆盖：旧记录中未被新记录覆盖的字段（如历史标签、
+    首次抓取时的原始字段）保留下来，避免重复抓取丢数据。
+    返回 (新增, 全部)。
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     old = {}
     if os.path.exists(CACHE_FILE):
@@ -373,8 +449,28 @@ def merge_incremental(all_rows):
 
     new_rows = []
     for r in all_rows:
-        if r["id"] not in old:
+        r = dict(r)
+        rss_source = bool(r.pop("_rss_source", False))
+        rid = r["id"]
+        if rid not in old:
             new_rows.append(r)
+            continue
+        # 已存在：字段级合并（新值优先，保留旧记录独有字段）
+        old_r = old[rid]
+        merged_r = dict(old_r)
+        for k, v in r.items():
+            if k == "id":
+                continue
+            if rss_source and k in {"replies", "views", "like_count", "posts_count", "bumped_at", "slug"}:
+                # RSS 不提供这些完整指标，不用 0/发布时间覆盖旧 JSON 数据。
+                continue
+            if k == "tags" and old_r.get("tags"):
+                # 标签并集：新老标签合并去重（老标签是人改过的，别丢）
+                merged_r[k] = list(dict.fromkeys(list(old_r["tags"]) + (v or [])))
+            else:
+                merged_r[k] = v
+        old[rid] = merged_r
+
     merged = list(old.values()) + new_rows
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=1)
@@ -468,16 +564,25 @@ def main():
     ap.add_argument("--full", action="store_true", help="全量模式：抓每个板块全部分页")
     ap.add_argument("--no-proxy", action="store_true", help="不使用代理")
     ap.add_argument("--json-only", action="store_true", help="只输出飞书插入 JSON，不落盘")
+    ap.add_argument("--content", action="store_true", help="新帖同时抓正文（存本地 topic_content.json）")
     ap.add_argument("--headless", action="store_true", help="无头模式")
+    ap.add_argument("--rss", action="store_true", help="无浏览器模式；每板块最新约25条，不含浏览/回复数")
     args = ap.parse_args()
 
     if not args.browse and not args.scrape:
         ap.print_help()
         sys.exit(0)
 
+    if args.rss and args.browse:
+        ap.error("--rss 不能与 --browse 同时使用")
+    if args.rss and args.full:
+        ap.error("RSS 只提供近期帖子；--full 需要浏览器模式")
+
     proxy = None if args.no_proxy else PROXY_DEFAULT
-    log(f"启动浏览器（proxy={proxy or '无'}）...")
-    pg = start_browser(proxy=proxy, headless=args.headless)
+    ctx = pg = None
+    if not args.rss:
+        log(f"启动浏览器（proxy={proxy or '无'}）...")
+        ctx, pg = start_browser(proxy=proxy, headless=args.headless)
 
     if args.browse:
         log("请在浏览器中登录 Linux.do（如已登录可忽略）")
@@ -493,14 +598,15 @@ def main():
                 time.sleep(5)
             else:
                 log("⚠️ 等待登录超时")
-        pg.quit()
+        ctx.close()
         sys.exit(0)
 
     if args.scrape:
-        if not check_login(pg):
-            log("❌ 未登录。请先运行: python linux_do_scraper.py --browse")
-            pg.quit()
-            sys.exit(1)
+        logged_in = args.rss or check_login(pg)
+        if not logged_in:
+            # Linux.do 是公开社区：未登录也能抓列表/正文（playwright 真实浏览器已过 CF）。
+            # 仅提示，不阻断（--browse 可补登录，能看到更多板块/更高频率）。
+            log("⚠️ 未检测到登录态（公开数据仍可抓，如需登录请先运行 --browse）")
 
         if args.cats:
             wanted = [c.strip() for c in args.cats.split(",")]
@@ -514,12 +620,18 @@ def main():
             max_pages = 40
         else:
             max_pages = 3
-        result = scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
+        result = scrape_all_rss(cats, limit=args.limit, proxy=proxy) if args.rss else scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
         all_rows = flatten(result)
-
-        # 自动打标
+        rss_contents = {}
         for row in all_rows:
-            row["tags"] = auto_tags(row.get("title", ""))
+            content = row.pop("_rss_content", "")
+            if content:
+                rss_contents[str(row.get("id"))] = content
+
+        # 自动打标：仅对新抓取且没有标签的记录打标（保留人工改过的标签）
+        for row in all_rows:
+            if not row.get("tags"):
+                row["tags"] = auto_tags(row.get("title", ""))
         log(f"打标完成（含标签的帖子: {sum(1 for r in all_rows if r['tags'])}/{len(all_rows)}）")
 
         log(f"共抓取 {len(all_rows)} 条帖子")
@@ -528,11 +640,34 @@ def main():
         new_rows, merged = merge_incremental(all_rows)
         log(f"本地缓存: 新增 {len(new_rows)} 条，累计 {len(merged)} 条 → {CACHE_FILE}")
 
+        # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json，不进飞书表）
+        if args.content and new_rows:
+            try:
+                from fetch_content import fetch_content as _fc, load_json as _lj, save_json as _sj, CONTENT_FILE
+                contents = _lj(CONTENT_FILE, {})
+                got = 0
+                for row in new_rows:
+                    if args.rss and str(row.get("id")) in rss_contents:
+                        content = rss_contents[str(row.get("id"))]
+                        res = {"content": content, "excerpt": content[:300] + ("…" if len(content) > 300 else ""),
+                               "author_raw": row.get("author", ""), "fetched_at": datetime.now().isoformat(timespec="seconds")}
+                    else:
+                        time.sleep(random.uniform(2, 4))
+                        res = _fc(pg, row)
+                    if res:
+                        contents[str(row.get("id"))] = res
+                        got += 1
+                _sj(CONTENT_FILE, contents)
+                log(f"新帖正文: 抓取 {got}/{len(new_rows)} 条 → {CONTENT_FILE}")
+            except Exception as e:
+                log(f"⚠️ 新帖正文抓取失败（不影响列表入库）: {e}")
+
         rows = feishu_rows(new_rows)
         print(json.dumps(rows, ensure_ascii=False))
         log(f"飞书待插入 {len(rows)} 条（增量）。可用 lark-cli base +record-create 写入。")
 
-        pg.quit()
+        if ctx:
+            ctx.close()
         sys.exit(0)
 
 

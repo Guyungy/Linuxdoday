@@ -19,6 +19,9 @@ python linux_do_scraper.py --browse
 # 2. 抓取（默认近期模式：每板块前3页≈90条，全板块约1000+条）+ 写入飞书
 python linux_do_scraper.py --scrape 2>/dev/null | python push_to_feishu.py
 
+# 无浏览器轻量模式（每板块最新约25条，无浏览量/回复数）
+python linux_do_scraper.py --scrape --rss 2>/dev/null | python push_to_feishu.py
+
 # 3. 常用变体
 python linux_do_scraper.py --scrape --cats 开发调优,前沿快讯   # 指定板块
 python linux_do_scraper.py --scrape --full                     # 全量分页(大)
@@ -29,7 +32,7 @@ python push_to_feishu.py --dry-run                             # 只看不写
 
 ## 关键技术点
 
-1. **绕过 Cloudflare**：linux.do 对裸 HTTP 请求（curl/requests/curl_cffi）全部 403（Turnstile 托管挑战）。必须在**真实 Chrome（DrissionPage）**里带登录 cookie 发同源请求，`fetch('/c/<slug>.json')` 返回 200 完整 JSON。
+1. **两种抓取通道**：`--rss` 通过 `curl_cffi` 读取板块 RSS，不启动浏览器，适合每日新帖增量。完整 Discourse JSON 仍受 Cloudflare 保护，默认模式使用真实 Chrome 中的同源 `fetch` 获取分页、浏览量和回复数。
 2. **数据源**：Discourse 官方 JSON API（浏览器内 fetch），字段结构化：作者/回复数/浏览量/发布时间/最近活跃/分类。`/c/<slug>.json?page=N` 分页。
 3. **增量去重**：本地 `data/linuxdo_topics.json` 按 Topic ID 缓存，只把新增帖子写入飞书。
 4. **写入飞书**：`lark-cli base +record-batch-create`，每批 ≤200 条。表结构见下。
