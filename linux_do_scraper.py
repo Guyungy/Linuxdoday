@@ -120,7 +120,7 @@ def _plain_text(html):
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
-def scrape_category_rss(cat, limit=0, proxy=None, retries=3):
+def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0):
     """无浏览器抓取板块 RSS。
 
     RSS 通常只包含最新 25 条，没有浏览量和回复数，但包含首帖正文。
@@ -131,6 +131,8 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3):
         raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
 
     url = BASE + cat["u"].rstrip("/") + ".rss"
+    if page:
+        url += f"?page={page}"
     kwargs = {"impersonate": "chrome", "timeout": 30}
     if proxy:
         kwargs["proxy"] = proxy if "://" in proxy else f"http://{proxy}"
@@ -178,12 +180,25 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3):
     return topics
 
 
-def scrape_all_rss(cats, limit=0, proxy=None):
+def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
     result = {}
     for cat in cats:
         log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
         try:
-            result[cat["n"]] = scrape_category_rss(cat, limit=limit, proxy=proxy)
+            topics = []
+            for page in range(max(1, pages)):
+                remaining = limit - len(topics) if limit else 0
+                if limit and remaining <= 0:
+                    break
+                page_topics = scrape_category_rss(
+                    cat, limit=remaining, proxy=proxy, page=page
+                )
+                if not page_topics:
+                    break
+                topics.extend(page_topics)
+                if page + 1 < pages:
+                    time.sleep(random.uniform(4, 7))
+            result[cat["n"]] = topics
         except Exception as exc:
             # 单个板块被限流或暂时失败时保留其他板块结果，
             # 避免长时间定时任务因一个 HTTP 429 整体丢失。
@@ -567,6 +582,8 @@ def main():
     ap.add_argument("--scrape", action="store_true", help="抓取帖子数据")
     ap.add_argument("--cats", default="", help="板块名逗号分隔，默认全部启用板块")
     ap.add_argument("--limit", type=int, default=0, help="每板块最多抓取条数（0=不限）")
+    ap.add_argument("--total-limit", type=int, default=0, help="本次全部板块合计最多处理 N 条（0=不限）")
+    ap.add_argument("--rss-pages", type=int, default=1, help="RSS 每板块抓取页数（默认1）")
     ap.add_argument("--recent", action="store_true", help="近期模式：每板块只抓前3页(约90条)，默认开启")
     ap.add_argument("--full", action="store_true", help="全量模式：抓每个板块全部分页")
     ap.add_argument("--no-proxy", action="store_true", help="不使用代理")
@@ -627,8 +644,10 @@ def main():
             max_pages = 40
         else:
             max_pages = 3
-        result = scrape_all_rss(cats, limit=args.limit, proxy=proxy) if args.rss else scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
+        result = scrape_all_rss(cats, limit=args.limit, proxy=proxy, pages=args.rss_pages) if args.rss else scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
         all_rows = flatten(result)
+        if args.total_limit:
+            all_rows = all_rows[:args.total_limit]
         rss_contents = {}
         for row in all_rows:
             content = row.pop("_rss_content", "")

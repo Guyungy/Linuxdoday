@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 LATEST_FILE = DATA_DIR / "latest_run.json"
+PENDING_FEISHU_FILE = DATA_DIR / "pending_feishu.json"
 
 
 def env_bool(name, default=False):
@@ -41,7 +42,10 @@ class ScrapeService:
         self.run_on_start = env_bool("RUN_ON_START", True)
         self.categories = os.environ.get("SCRAPE_CATEGORIES", "").strip()
         self.limit = max(0, int(os.environ.get("SCRAPE_LIMIT", "0")))
+        self.total_limit = max(0, int(os.environ.get("SCRAPE_TOTAL_LIMIT", "0")))
+        self.rss_pages = max(1, int(os.environ.get("SCRAPE_RSS_PAGES", "1")))
         self.with_content = env_bool("SCRAPE_CONTENT", False)
+        self.push_to_feishu = env_bool("PUSH_TO_FEISHU", False)
         self.token = os.environ.get("SERVICE_TOKEN", "").strip()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -54,6 +58,7 @@ class ScrapeService:
             "last_success_at": None,
             "last_error": None,
             "last_new_topics": 0,
+            "last_pushed_topics": 0,
             "runs": 0,
         }
 
@@ -64,6 +69,7 @@ class ScrapeService:
             "interval_seconds": self.interval,
             "categories": self.categories.split(",") if self.categories else "enabled_defaults",
             "content_enabled": self.with_content,
+            "feishu_push_enabled": self.push_to_feishu,
             "manual_run_enabled": bool(self.token),
         })
         return result
@@ -76,6 +82,10 @@ class ScrapeService:
             command.extend(["--cats", self.categories])
         if self.limit:
             command.extend(["--limit", str(self.limit)])
+        if self.total_limit:
+            command.extend(["--total-limit", str(self.total_limit)])
+        if self.rss_pages > 1:
+            command.extend(["--rss-pages", str(self.rss_pages)])
         if self.with_content:
             command.append("--content")
         return command
@@ -111,6 +121,43 @@ class ScrapeService:
                     })
                 return False, str(exc)
 
+            pushed = 0
+            if self.push_to_feishu:
+                try:
+                    pending = json.loads(PENDING_FEISHU_FILE.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pending = []
+                by_id = {str(row.get("Topic ID")): row for row in pending if row.get("Topic ID")}
+                by_id.update({str(row.get("Topic ID")): row for row in rows if row.get("Topic ID")})
+                to_push = list(by_id.values())
+            else:
+                to_push = []
+
+            if to_push:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                PENDING_FEISHU_FILE.write_text(
+                    json.dumps(to_push, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                push = subprocess.run(
+                    [sys.executable, str(ROOT / "push_to_feishu.py")],
+                    cwd=ROOT,
+                    input=json.dumps(to_push, ensure_ascii=False),
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    env=os.environ.copy(),
+                )
+                if push.returncode != 0:
+                    error = (push.stderr or push.stdout or "unknown Feishu push error")[-4000:]
+                    with self.state_lock:
+                        self.state.update({
+                            "status": "error", "last_finished_at": utc_now(), "last_error": error,
+                            "runs": self.state["runs"] + 1,
+                        })
+                    return False, error
+                pushed = len(to_push)
+                PENDING_FEISHU_FILE.unlink(missing_ok=True)
+
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             payload = {"generated_at": utc_now(), "trigger": trigger, "count": len(rows), "topics": rows}
             temporary = LATEST_FILE.with_suffix(".tmp")
@@ -121,6 +168,7 @@ class ScrapeService:
                 self.state.update({
                     "status": "idle", "last_finished_at": now, "last_success_at": now,
                     "last_error": None, "last_new_topics": len(rows), "runs": self.state["runs"] + 1,
+                    "last_pushed_topics": pushed,
                 })
             return True, f"scrape completed: {len(rows)} new topics"
         except subprocess.TimeoutExpired:

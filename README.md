@@ -73,8 +73,11 @@ python service.py --once
 | `RUN_ON_START` | `true` | 服务启动后是否立即抓取 |
 | `SCRAPE_CATEGORIES` | 空 | 板块名逗号分隔；为空使用默认启用板块 |
 | `SCRAPE_LIMIT` | `0` | 每个板块最多抓取数量；0 表示 RSS 默认数量 |
+| `SCRAPE_TOTAL_LIMIT` | `0` | 一轮全部板块合计最多处理数量 |
+| `SCRAPE_RSS_PAGES` | `1` | 每个板块读取的 RSS 页数 |
 | `SCRAPE_CONTENT` | `false` | 是否把 RSS 首帖正文写入正文缓存 |
 | `LINUXDO_PROXY` | 空 | 可选 HTTP 代理 |
+| `PUSH_TO_FEISHU` | `false` | 抓取后自动调用本机 `lark-cli` 写入飞书 |
 
 示例：
 
@@ -83,6 +86,7 @@ export SCRAPE_INTERVAL_SECONDS=3600
 export SCRAPE_CATEGORIES="开发调优,前沿快讯"
 export SCRAPE_LIMIT=10
 export SERVICE_TOKEN="your-secret"
+export PUSH_TO_FEISHU=true
 python service.py
 ```
 
