@@ -59,7 +59,18 @@ def feishu_rows(rows):
 
 
 def load_from_stdin():
-    return json.load(sys.stdin)
+    """读 stdin 的 JSON。上游抓取失败时管道会传来空内容，这里给出可读提示
+    而不是抛 JSONDecodeError 堆栈。"""
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print("✗ 上游没有输出任何数据（抓取可能失败）。"
+              "请检查 linux_do_scraper.py 的 stderr 日志。", file=sys.stderr)
+        sys.exit(2)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"✗ 上游输出不是合法 JSON：{exc}\n  前 200 字符: {raw[:200]!r}", file=sys.stderr)
+        sys.exit(2)
 
 
 def load_from_file(path):

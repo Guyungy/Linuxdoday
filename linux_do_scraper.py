@@ -94,14 +94,16 @@ def kill_stale_chrome():
         pass
 
 
-def start_browser(proxy=None, headless=False):
+def start_browser(proxy=None, headless=False, offscreen=True):
     """启动 playwright 持久化上下文（复用 browser_data 登录态）。
 
     返回 (ctx, page)。调用方用完必须 ctx.close()。
     headless=True 会被 Cloudflare 拦截，默认 False。
+    offscreen=True（默认）把窗口移到屏幕外：不弹窗、不抢焦点，但仍是有头
+    真实浏览器，可正常通过 CF。用 --show-browser 可改回可见窗口。
     """
     from browser_utils import start_browser as start_browser_pw
-    return start_browser_pw(proxy=proxy, headless=headless)
+    return start_browser_pw(proxy=proxy, headless=headless, offscreen=offscreen)
 
 
 def check_login(page):
@@ -222,6 +224,7 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
     topics = []
     seen = set()
     page_num = 0
+    retried = False
 
     while page_num < max_pages:
         page_num += 1
@@ -241,6 +244,14 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
         """, {"slug": slug, "page": page_num - 1})
 
         if not data or data.get("error"):
+            if not retried:
+                # CF cookie 可能刚建立：等一会重试同一页，再失败才回退 DOM
+                retried = True
+                err = data.get("error") if data else "空"
+                log(f"  板块[{cat['n']}] JSON 失败({err})，8s 后重试")
+                time.sleep(8)
+                page_num -= 1
+                continue
             log(f"  板块[{cat['n']}] JSON 失败({data.get('error') if data else '空'})，回退 DOM 解析")
             return scrape_category_dom(pg, cat, limit=limit, page_delay=page_delay)
 
@@ -401,7 +412,6 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
             });
             return out;
         }
-        return scrapePage();
         """)
 
         fresh = 0
@@ -590,6 +600,7 @@ def main():
     ap.add_argument("--json-only", action="store_true", help="只输出飞书插入 JSON，不落盘")
     ap.add_argument("--content", action="store_true", help="新帖同时抓正文（存本地 topic_content.json）")
     ap.add_argument("--headless", action="store_true", help="无头模式")
+    ap.add_argument("--show-browser", action="store_true", help="显示浏览器窗口（默认离屏，不干扰桌面）")
     ap.add_argument("--rss", action="store_true", help="无浏览器模式；每板块最新约25条，不含浏览/回复数")
     args = ap.parse_args()
 
@@ -606,7 +617,8 @@ def main():
     ctx = pg = None
     if not args.rss:
         log(f"启动浏览器（proxy={proxy or '无'}）...")
-        ctx, pg = start_browser(proxy=proxy, headless=args.headless)
+        ctx, pg = start_browser(proxy=proxy, headless=args.headless,
+                                offscreen=not getattr(args, "show_browser", False))
 
     if args.browse:
         log("请在浏览器中登录 Linux.do（如已登录可忽略）")
@@ -637,6 +649,12 @@ def main():
             cats = [c for c in CATS if c["n"] in wanted]
         else:
             cats = [c for c in CATS if c["e"]]
+
+        # 浏览器模式：等 CF cookie 就绪再抓，否则首批 fetch 会 403 并回退到 DOM 解析
+        if not args.rss:
+            from browser_utils import wait_json_ready
+            if not wait_json_ready(pg, timeout=90):
+                log("⚠️ CF 未就绪，仍继续尝试（失败会回退 DOM 解析）")
 
         log(f"开始抓取 {len(cats)} 个板块...")
         # 模式：--full 全量分页；--recent 或默认 → 每板块前3页（近期活跃）

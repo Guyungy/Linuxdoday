@@ -64,10 +64,13 @@ def kill_stale_chrome(port=9222):
             pass
 
 
-def start_browser(proxy=PROXY_DEFAULT, headless=False):
-    """启动 playwright 持久化上下文（复用 browser_data 登录态，绕过 CF）"""
+def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
+    """启动 playwright 持久化上下文（复用 browser_data 登录态，绕过 CF）
+
+    offscreen=True（默认）窗口在屏幕外，不弹窗不抢焦点（headless 会被 CF 拦）。
+    """
     from browser_utils import start_browser as _start
-    ctx, page = _start(proxy=proxy, headless=headless)
+    ctx, page = _start(proxy=proxy, headless=headless, offscreen=offscreen)
     # 兼容旧接口：返回 page；context 挂在 page 上由调用方 close
     page._ctx = ctx
     return page
@@ -159,6 +162,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只统计不抓取")
     ap.add_argument("--no-proxy", action="store_true", help="不走代理")
     ap.add_argument("--headless", action="store_true", help="无头模式")
+    ap.add_argument("--show-browser", action="store_true", help="显示浏览器窗口（默认离屏，不干扰桌面）")
     args = ap.parse_args()
 
     rows = load_json(CACHE_FILE, [])
@@ -179,7 +183,8 @@ def main():
         return
 
     kill_stale_chrome()
-    pg = start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT, headless=args.headless)
+    pg = start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT, headless=args.headless,
+                       offscreen=not getattr(args, "show_browser", False))
     if not check_login(pg):
         # Linux.do 公开社区：未登录也能抓正文（playwright 真实浏览器已过 CF）。仅提示不阻断。
         log("⚠️ 未检测到登录态（公开数据仍可抓，如需登录请先运行 --browse）")

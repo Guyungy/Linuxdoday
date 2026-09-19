@@ -52,24 +52,56 @@ def kill_stale_chrome():
         pass
 
 
-def start_browser(proxy=PROXY_DEFAULT, headless=False):
+def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
     """启动 playwright 持久化上下文（复用 browser_data 登录态）。
 
     返回 (context, page)。调用方用完必须 ctx.close()。
     headless=True 会被 Cloudflare 拦截（返回挑战页），所以默认 False。
+    offscreen=True（默认）：窗口开到屏幕外，不抢焦点、不遮挡桌面，但仍是
+      有头真实浏览器 —— 实测可正常通过 Cloudflare（headless 则 403）。
     """
     kill_stale_chrome()
     p = sync_playwright().start()
+    args = ["--disable-blink-features=AutomationControlled"]
+    if offscreen and not headless:
+        # 移到可视区域之外；窗口仍存在，只是用户看不见
+        args += ["--window-position=-2400,-2400", "--window-size=1280,900"]
     ctx = p.chromium.launch_persistent_context(
         user_data_dir=USER_DATA_DIR,
         channel="chrome",          # 用系统已装的 Google Chrome（非 bundled chromium）
         headless=headless,
         proxy={"server": f"http://{proxy}"} if proxy else None,
-        args=["--disable-blink-features=AutomationControlled"],
+        args=args,
         viewport={"width": 1920, "height": 1080},
     )
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return ctx, page
+
+
+def wait_json_ready(page, slug="develop/4", timeout=90, interval=3):
+    """等待 Cloudflare cookie 就绪：浏览器内 fetch 板块 JSON 直到返回 200。
+
+    刚 launch_persistent_context + goto 后立刻 fetch 常拿到 403（cf_clearance
+    还没完全生效），等几秒后即正常。返回 True/False。
+    """
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            last = page.evaluate("""async (slug) => {
+                try {
+                    const r = await fetch("/c/" + slug + ".json?page=0",
+                        {credentials: "include", headers: {"Accept": "application/json"}});
+                    return r.status;
+                } catch (e) { return "ERR:" + e; }
+            }""", slug)
+        except Exception as exc:
+            last = f"EXC:{type(exc).__name__}"
+        if last == 200:
+            return True
+        time.sleep(interval)
+    log(f"⚠️ JSON 接口就绪等待超时（{timeout}s），最后状态: {last}")
+    return False
 
 
 def check_login(page, timeout=45):
