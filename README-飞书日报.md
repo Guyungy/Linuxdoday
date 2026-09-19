@@ -15,7 +15,8 @@
 
 ```bash
 # 1. 首次：打开可见浏览器人工登录（之后登录态存在 browser_data/ 复用）
-python linux_do_scraper.py --browse --show-browser
+#    --browse 会自动用可见窗口，不需要额外加 --show-browser
+python linux_do_scraper.py --browse
 
 # 2. 抓取（默认近期模式：每板块前3页≈90条，全板块约1000+条）+ 写入飞书
 #    默认【离屏运行】：浏览器窗口开到屏幕外，不弹窗、不抢焦点、不干扰桌面

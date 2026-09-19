@@ -616,9 +616,10 @@ def main():
     proxy = None if args.no_proxy else PROXY_DEFAULT
     ctx = pg = None
     if not args.rss:
-        log(f"启动浏览器（proxy={proxy or '无'}）...")
-        ctx, pg = start_browser(proxy=proxy, headless=args.headless,
-                                offscreen=not getattr(args, "show_browser", False))
+        # --browse 要人工登录，必须让窗口可见；其余场景默认离屏（不干扰桌面）
+        offscreen = not (args.show_browser or args.browse)
+        log(f"启动浏览器（proxy={proxy or '无'}，{'可见窗口' if not offscreen else '离屏'}）...")
+        ctx, pg = start_browser(proxy=proxy, headless=args.headless, offscreen=offscreen)
 
     if args.browse:
         log("请在浏览器中登录 Linux.do（如已登录可忽略）")
