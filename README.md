@@ -2,6 +2,8 @@
 
 Linuxdoday 是一个可部署在 Linux 服务器、NAS、Docker、云主机或本地电脑上的 Linux.do 数据抓取后台服务。
 
+![Tests](https://github.com/Guyungy/Linuxdoday/actions/workflows/test.yml/badge.svg)
+
 默认使用 RSS 通道，不需要桌面环境、Chrome 或浏览器自动化。服务会定时抓取最新帖子，保存增量缓存，并通过 HTTP API 提供健康状态、运行状态、最新结果和手动触发能力。
 
 ## 快速部署：Docker Compose
@@ -53,6 +55,7 @@ python service.py --once
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用 |
+| `GET` | `/ready` | 就绪检查，服务初始化完成后返回 200 |
 | `GET` | `/status` | 当前状态、最近成功时间、运行次数和错误信息 |
 | `GET` | `/topics` | 最近一次运行发现的新增帖子 |
 | `POST` | `/run` | 异步触发抓取，需要 Bearer Token |
@@ -68,6 +71,7 @@ python service.py --once
 | `SERVICE_HOST` | `0.0.0.0` | HTTP 监听地址 |
 | `SERVICE_PORT` | `8080` | HTTP 端口 |
 | `SERVICE_TOKEN` | 空 | 手动触发令牌；为空时禁用 `/run` |
+| `PROTECT_READ_ENDPOINTS` | `false` | 是否也用 Bearer Token 保护 `/status` 和 `/topics` |
 | `SCRAPE_INTERVAL_SECONDS` | `21600` | 抓取间隔，默认 6 小时，最小 60 秒 |
 | `SCRAPE_TIMEOUT_SECONDS` | `1800` | 单次抓取超时 |
 | `RUN_ON_START` | `true` | 服务启动后是否立即抓取 |
@@ -78,6 +82,8 @@ python service.py --once
 | `SCRAPE_CONTENT` | `false` | 是否把 RSS 首帖正文写入正文缓存 |
 | `LINUXDO_PROXY` | 空 | 可选 HTTP 代理 |
 | `PUSH_TO_FEISHU` | `false` | 抓取后自动调用本机 `lark-cli` 写入飞书 |
+| `LARK_PROFILE` | `claw` | 飞书 `lark-cli` 配置名 |
+| `FEISHU_ID_CACHE_SECONDS` | `86400` | 飞书 Topic ID 本地索引有效期，避免每轮扫全表 |
 
 示例：
 
@@ -97,6 +103,10 @@ python service.py
 - `linuxdo_topics.json`：按 Topic ID 合并的历史缓存。
 - `latest_run.json`：最近一次运行新增的帖子，也是 `/topics` 的数据来源。
 - `topic_content.json`：启用 `SCRAPE_CONTENT` 后的正文缓存。
+- `pending_feishu.json`：飞书同步失败时的待重试队列，成功后自动清理。
+- `feishu_topic_ids.json`：飞书去重索引，显著减少大表重复扫描。
+
+> 自动写入飞书需要运行环境已安装并配置 `lark-cli`。默认 Docker 镜像只负责抓取和 HTTP API，不内置个人飞书凭据。
 
 Docker Compose 使用命名卷 `linuxdoday-data` 保存数据，更新或重建容器不会丢失。
 

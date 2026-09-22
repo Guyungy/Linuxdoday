@@ -122,7 +122,7 @@ def _plain_text(html):
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
-def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0):
+def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=None):
     """无浏览器抓取板块 RSS。
 
     RSS 通常只包含最新 25 条，没有浏览量和回复数，但包含首帖正文。
@@ -138,17 +138,23 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0):
     kwargs = {"impersonate": "chrome", "timeout": 30}
     if proxy:
         kwargs["proxy"] = proxy if "://" in proxy else f"http://{proxy}"
+    client = session or curl_requests
     response = None
     for attempt in range(1, retries + 1):
-        response = curl_requests.get(url, **kwargs)
+        response = client.get(url, **kwargs)
         if response.status_code == 200:
             break
         if attempt < retries:
-            delay = attempt * 5
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = min(60, max(1, int(retry_after)))
+            except (TypeError, ValueError):
+                delay = min(60, (2 ** (attempt - 1)) * 5 + random.uniform(0, 2))
             log(f"  RSS HTTP {response.status_code}，{delay}s 后重试 ({attempt}/{retries})")
             time.sleep(delay)
     if response is None or response.status_code != 200:
-        raise RuntimeError(f"RSS 请求失败: HTTP {response.status_code if response else 'unknown'}")
+        status = response.status_code if response is not None else "unknown"
+        raise RuntimeError(f"RSS 请求失败: HTTP {status}")
 
     root = ElementTree.fromstring(response.content)
     dc_creator = "{http://purl.org/dc/elements/1.1/}creator"
@@ -183,31 +189,36 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0):
 
 
 def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
+
     result = {}
-    for cat in cats:
-        log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
-        try:
+    with curl_requests.Session() as session:
+        for cat in cats:
+            log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
             topics = []
             for page in range(max(1, pages)):
-                remaining = limit - len(topics) if limit else 0
-                if limit and remaining <= 0:
+                try:
+                    remaining = limit - len(topics) if limit else 0
+                    if limit and remaining <= 0:
+                        break
+                    page_topics = scrape_category_rss(
+                        cat, limit=remaining, proxy=proxy, page=page, session=session
+                    )
+                    if not page_topics:
+                        break
+                    topics.extend(page_topics)
+                    if page + 1 < pages:
+                        time.sleep(random.uniform(4, 7))
+                except Exception as exc:
+                    # 后续页被限流时，保留该板块已抓到的前几页。
+                    log(f"  ⚠️ 板块[{cat['n']}] 第{page + 1}页失败，保留已抓 {len(topics)} 条: {exc}")
                     break
-                page_topics = scrape_category_rss(
-                    cat, limit=remaining, proxy=proxy, page=page
-                )
-                if not page_topics:
-                    break
-                topics.extend(page_topics)
-                if page + 1 < pages:
-                    time.sleep(random.uniform(4, 7))
             result[cat["n"]] = topics
-        except Exception as exc:
-            # 单个板块被限流或暂时失败时保留其他板块结果，
-            # 避免长时间定时任务因一个 HTTP 429 整体丢失。
-            log(f"  ⚠️ 板块[{cat['n']}] 抓取失败，继续下一个: {exc}")
-            result[cat["n"]] = []
-        log(f"  → 板块[{cat['n']}] 共 {len(result[cat['n']])} 条")
-        time.sleep(random.uniform(4, 7))
+            log(f"  → 板块[{cat['n']}] 共 {len(result[cat['n']])} 条")
+            time.sleep(random.uniform(4, 7))
     return result
 
 
@@ -452,10 +463,15 @@ def scrape_all(pg, cats, limit=0, max_pages=40):
 
 
 def flatten(result):
-    """把所有板块结果拍平，附板块名"""
+    """把所有板块结果拍平，附板块名，并按 Topic ID 去重。"""
     rows = []
+    seen = set()
     for cat_name, topics in result.items():
         for t in topics:
+            topic_id = str(t.get("id") or "")
+            if not topic_id or topic_id in seen:
+                continue
+            seen.add(topic_id)
             t = dict(t)
             t["category"] = cat_name
             rows.append(t)
@@ -479,12 +495,17 @@ def merge_incremental(all_rows):
             log(f"缓存读取失败（忽略）: {e}")
 
     new_rows = []
+    new_ids = set()
     for r in all_rows:
         r = dict(r)
         rss_source = bool(r.pop("_rss_source", False))
         rid = r["id"]
-        if rid not in old:
+        if rid not in old and rid not in new_ids:
             new_rows.append(r)
+            new_ids.add(rid)
+            continue
+        if rid in new_ids:
+            # 同一轮重复出现的话题不再追加，避免缓存和飞书产生重复行。
             continue
         # 已存在：字段级合并（新值优先，保留旧记录独有字段）
         old_r = old[rid]

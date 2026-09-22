@@ -22,6 +22,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 DEFAULT_BASE_TOKEN = "LYdZbR3DTaFPeYsHP8ScqPVCnFe"
 DEFAULT_TABLE = "帖子主题"
@@ -30,7 +32,34 @@ BATCH = 200  # lark-cli 单次最大 200
 # 关键：必须用创建该 Base 的 app profile（claw / cli_aa0112b836bf5be2）。
 # 默认 active profile 是 huidu（cli_aa20b02703b99d18），对这张表无权限（91403）。
 # 命名 profile 见 ~/.lark-cli/config.json（config init --name claw）。
-LARK_PROFILE = "claw"
+LARK_PROFILE = os.environ.get("LARK_PROFILE", "claw")
+CACHE_FILE = Path(__file__).resolve().parent / "data" / "feishu_topic_ids.json"
+CACHE_TTL = max(0, int(os.environ.get("FEISHU_ID_CACHE_SECONDS", "86400")))
+
+
+def atomic_write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_id_cache():
+    try:
+        payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        age = time.time() - float(payload.get("updated_at", 0))
+        if age <= CACHE_TTL:
+            return {str(value) for value in payload.get("topic_ids", [])}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def save_id_cache(ids):
+    atomic_write_json(CACHE_FILE, {
+        "updated_at": time.time(),
+        "topic_ids": sorted(ids),
+    })
 
 
 def feishu_rows(rows):
@@ -80,6 +109,10 @@ def load_from_file(path):
 
 def existing_topic_ids(base_token, table):
     """查询飞书表中已存在的 Topic ID 集合（幂等去重用）"""
+    cached = load_id_cache()
+    if cached is not None:
+        print(f"  已从本地索引读取 {len(cached)} 个 Topic ID")
+        return cached
     ids = set()
     offset = 0
     while True:
@@ -113,6 +146,7 @@ def existing_topic_ids(base_token, table):
         if len(rows) < 200:
             break
         offset += len(rows)
+    save_id_cache(ids)
     return ids
 
 
@@ -126,7 +160,7 @@ def dedupe_against_feishu(base_token, table, rows):
     return kept, skipped
 
 
-def push(base_token, table, rows, dry_run=False):
+def push(base_token, table, rows, dry_run=False, known_ids=None):
     total = len(rows)
     if total == 0:
         print("无待写入记录")
@@ -162,6 +196,9 @@ def push(base_token, table, rows, dry_run=False):
         except Exception:
             created = len(chunk)
         written += created
+        if known_ids is not None and created == len(chunk):
+            known_ids.update(str(row.get("Topic ID")) for row in chunk if row.get("Topic ID"))
+            save_id_cache(known_ids)
         print(f"  ✅ 已写 {created} 条")
     print(f"完成：写入 {written}/{total} 条 → 表 [{table}]")
     return written
@@ -173,6 +210,7 @@ def main():
     ap.add_argument("--table", default=DEFAULT_TABLE)
     ap.add_argument("--file", default="", help="从本地 JSON 文件读取")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--result-file", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.file:
@@ -204,14 +242,29 @@ def main():
         return
 
     # 幂等双保险：剔除飞书表中已存在的 Topic ID（防止本地缓存丢失/误删导致重复入库）
-    rows, skipped = dedupe_against_feishu(args.base_token, args.table, rows)
+    known_ids = existing_topic_ids(args.base_token, args.table)
+    if known_ids is None:
+        known_ids = set()
+        print("⚠️ 无法确认远端去重状态，本次停止写入以避免重复数据", file=sys.stderr)
+        raise SystemExit(3)
+    original = len(rows)
+    rows = [r for r in rows if str(r.get("Topic ID", "")) not in known_ids]
+    skipped = original - len(rows)
     if skipped:
         print(f"已跳过 {skipped} 条已入库记录（按 Topic ID 去重）")
     if not rows:
         print("无新增记录")
+        if args.result_file:
+            atomic_write_json(Path(args.result_file), {"requested": original, "skipped": skipped, "written": 0})
         return
 
-    push(args.base_token, args.table, rows)
+    written = push(args.base_token, args.table, rows, known_ids=known_ids)
+    if args.result_file:
+        atomic_write_json(Path(args.result_file), {
+            "requested": original, "skipped": skipped, "written": written,
+        })
+    if written != len(rows):
+        raise SystemExit(4)
 
 
 if __name__ == "__main__":

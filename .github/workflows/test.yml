@@ -1,0 +1,25 @@
+name: Test backend service
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install service dependencies
+        run: pip install -r requirements-service.txt
+      - name: Compile and test
+        run: |
+          python -m py_compile linux_do_scraper.py service.py push_to_feishu.py fetch_content.py
+          python -m unittest discover -s tests -v

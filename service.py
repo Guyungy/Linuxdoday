@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,6 +22,14 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 LATEST_FILE = DATA_DIR / "latest_run.json"
 PENDING_FEISHU_FILE = DATA_DIR / "pending_feishu.json"
+PUSH_RESULT_FILE = DATA_DIR / ".push_result.json"
+
+
+def atomic_write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def env_bool(name, default=False):
@@ -47,6 +55,7 @@ class ScrapeService:
         self.with_content = env_bool("SCRAPE_CONTENT", False)
         self.push_to_feishu = env_bool("PUSH_TO_FEISHU", False)
         self.token = os.environ.get("SERVICE_TOKEN", "").strip()
+        self.protect_reads = env_bool("PROTECT_READ_ENDPOINTS", False)
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
@@ -59,6 +68,7 @@ class ScrapeService:
             "last_error": None,
             "last_new_topics": 0,
             "last_pushed_topics": 0,
+            "next_run_at": None,
             "runs": 0,
         }
 
@@ -71,6 +81,7 @@ class ScrapeService:
             "content_enabled": self.with_content,
             "feishu_push_enabled": self.push_to_feishu,
             "manual_run_enabled": bool(self.token),
+            "read_auth_enabled": self.protect_reads,
         })
         return result
 
@@ -135,11 +146,11 @@ class ScrapeService:
 
             if to_push:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
-                PENDING_FEISHU_FILE.write_text(
-                    json.dumps(to_push, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
+                atomic_write_json(PENDING_FEISHU_FILE, to_push)
+                PUSH_RESULT_FILE.unlink(missing_ok=True)
                 push = subprocess.run(
-                    [sys.executable, str(ROOT / "push_to_feishu.py")],
+                    [sys.executable, str(ROOT / "push_to_feishu.py"),
+                     "--result-file", str(PUSH_RESULT_FILE)],
                     cwd=ROOT,
                     input=json.dumps(to_push, ensure_ascii=False),
                     capture_output=True,
@@ -155,14 +166,17 @@ class ScrapeService:
                             "runs": self.state["runs"] + 1,
                         })
                     return False, error
-                pushed = len(to_push)
+                try:
+                    push_result = json.loads(PUSH_RESULT_FILE.read_text(encoding="utf-8"))
+                    pushed = int(push_result.get("written", 0))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pushed = 0
                 PENDING_FEISHU_FILE.unlink(missing_ok=True)
+                PUSH_RESULT_FILE.unlink(missing_ok=True)
 
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             payload = {"generated_at": utc_now(), "trigger": trigger, "count": len(rows), "topics": rows}
-            temporary = LATEST_FILE.with_suffix(".tmp")
-            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(LATEST_FILE)
+            atomic_write_json(LATEST_FILE, payload)
             with self.state_lock:
                 now = utc_now()
                 self.state.update({
@@ -188,8 +202,16 @@ class ScrapeService:
         else:
             with self.state_lock:
                 self.state["status"] = "idle"
-        while not self.stop_event.wait(self.interval):
+        while True:
+            with self.state_lock:
+                self.state["next_run_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=self.interval)
+                ).isoformat(timespec="seconds")
+            if self.stop_event.wait(self.interval):
+                break
             self.run_once("schedule")
+        with self.state_lock:
+            self.state["next_run_at"] = None
 
     def topics(self):
         try:
@@ -217,12 +239,28 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self.send_json(200, {"ok": True, "status": SERVICE.snapshot()["status"]})
+        elif path == "/ready":
+            state = SERVICE.snapshot()
+            ready = state["status"] != "starting"
+            self.send_json(200 if ready else 503, {"ready": ready, "status": state["status"]})
         elif path == "/status":
+            if not self.read_authorized():
+                return
             self.send_json(200, SERVICE.snapshot())
         elif path == "/topics":
+            if not self.read_authorized():
+                return
             self.send_json(200, SERVICE.topics())
         else:
             self.send_json(404, {"error": "not found"})
+
+    def read_authorized(self):
+        if not SERVICE.protect_reads:
+            return True
+        if SERVICE.token and self.headers.get("Authorization") == f"Bearer {SERVICE.token}":
+            return True
+        self.send_json(401, {"error": "unauthorized"})
+        return False
 
     def do_POST(self):
         if urlparse(self.path).path != "/run":
