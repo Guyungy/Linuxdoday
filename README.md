@@ -137,7 +137,7 @@ python service.py --once
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用，**永不需要令牌** |
+| `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用，**永不需要令牌**。返回 200，但 `ok` 只在**调度线程活着**时为 `true`；线程死了 `ok=false`（见〈`/status` 里的失败现场〉） |
 | `GET` | `/ready` | 就绪检查，服务初始化完成后返回 200，**永不需要令牌** |
 | `GET` | `/status` | 当前状态、最近成功时间、运行次数和错误信息；`PROTECT_READ_ENDPOINTS=true` 时需令牌 |
 | `GET` | `/topics` | 最近一次运行发现的新增帖子；同上需令牌 |
@@ -164,6 +164,12 @@ python service.py --once
   否则一个坏掉的抓取窗口会被静默吞掉，表现为「今天社区没发新帖」；
 - 热榜、正文这类**附加数据**抓失败不影响列表入库，但现场会带 `WARN:` 前缀从子进程
   stderr 传出来，写进 `last_error`（原始 stderr 留在 `last_stderr`）。
+- **服务自称健康、其实已停止抓取**是另一类故障，看 `scheduler_alive` / `last_tick_at`：
+  调度线程退出后 `/health` 的 `ok` 立刻变 `false`，不会再有「全绿但不再抓取」。
+- `consecutive_failures` 是**连续**失败轮数（成功一轮即清零），`last_error_repeat` 是
+  **同一条**错误连续出现的次数：重复的同一错误不再每轮刷 stderr（每
+  `FAILURE_REANNOUNCE_EVERY` = 4 轮重播一次），免得「每 6 小时一条 error」
+  变成新的背景噪音。
 
 ## 配置
 
@@ -186,7 +192,7 @@ python service.py --once
 | `SCRAPE_RSS_PAGES` | `1` | 每个板块读取的 RSS 页数（仅 `rss` 模式；≥2 容易 429） |
 | `SCRAPE_CONTENT` | `false` | 是否抓取新帖正文（存入正文缓存，并随该行一起写入飞书） |
 | `SCRAPE_CONTENT_LIMIT` | `0` | 单轮最多抓 N 条正文；0 = 不限。建议设为几百，避免大轮次把 `SCRAPE_TIMEOUT_SECONDS` 耗尽 |
-| `SCRAPE_HOT` | browser 模式默认 `true` | 是否同时抓官方热榜（1 次请求）写入 `data/hot_topics.json` |
+| `SCRAPE_HOT` | browser 模式默认 `true` | 是否同时抓官方热榜（1 次请求）写入 `data/hot_topics.json`。**在 `rss` 模式下无效**：`--hot` 只在 browser 模式传给抓取器（`command()` 里 `mode == "browser"` 才追加） |
 | `LINUXDO_PROXY` | 空 | 可选 HTTP 代理 |
 | `PUSH_TO_FEISHU` | `false` | 抓取后自动调用本机 `lark-cli` 写入飞书 |
 | `LARK_PROFILE` | `claw` | 飞书 `lark-cli` 配置名 |
@@ -355,20 +361,49 @@ launchctl list | grep linuxdoday
 
 ## Kubernetes / PaaS
 
-使用仓库根目录的 `Dockerfile.service` 构建镜像（默认 `rss` 目标；要 browser 模式加 `--target browser`）。容器监听 `8080`，健康检查路径为 `/health`，持久化目录为 `/app/data`。Render、Railway、Fly.io、Kubernetes、群晖 Container Manager 等平台都可以使用同一镜像。
+使用仓库根目录的 `Dockerfile.service` 构建镜像（默认 `rss` 目标；要 browser 模式加 `--target browser`）。**注意**：镜像从未真实构建过，「容器内能否跑通 browser 模式」未验证 —— 先读〈服务镜像的能力边界〉再决定要不要用 `browser` 目标。容器监听 `8080`，健康检查路径为 `/health`，持久化目录为 `/app/data`。Render、Railway、Fly.io、Kubernetes、群晖 Container Manager 等平台都可以使用同一镜像。
 
 ## 说明
 
 - RSS 通道每个板块通常返回最新约 25 条，包含标题、作者、发布时间和首帖正文，但没有浏览量、回复数等完整指标。
-- 服务镜像的 `browser` 目标会带上 `playwright` 与 Chrome，可跑 browser 模式；
+- 服务镜像的 `browser` 目标**装了什么**有断言，**能不能跑**没验证过：
+  镜像从未真实构建，「容器内有头 Chrome 能否过 Cloudflare」未知，
+  唯一验证过能跑 browser 模式的路径是**本机源码运行** —— 见下面
+  〈服务镜像的能力边界〉。
   `linux_do_gui.py` / `linux_do_headless.py` / `linux_do_auto_browse.py` 这几个
   桌面/DrissionPage 脚本仍不随镜像发布。
 - DrissionPage 路线（`linux_do_headless.py` 等）已弃用：4.x 与 Chrome 153 不兼容
   （WebSocket 404），`.github/workflows/run-schedule.yml` 保留但已标注为 legacy，
   且定时触发早已禁用。抓数据请用 `service.py`。
-- **0 条抓取结果 = 失败**：一轮跑完一条都没拿到会以非零退出，不会刷新 `last_success_at`。
-  判断依据是「14 个板块翻完不可能零新增」，而不是「可能没事」。
+- **0 条抓取结果 = 失败**，且有两道独立的门：抓取器自己拿到 0 条会非零退出；
+  **service 侧另有一道**（browser 模式 + 没指定 `--cats` + 0 条 → 同样判失败、
+  不刷新 `last_success_at`、不覆盖 `latest_run.json`）。判断依据是
+  「14 个板块翻完不可能零新增」，而不是「可能没事」。
+  为什么要两道：`last_success_at` 是 **service** 刷的，只在抓取器里改等于把结论
+  托付给子进程的自觉。
+- 连续失败会计数（`consecutive_failures`）并对重复的同一错误去重
+  （`last_error_repeat`），不会每轮刷一条一样的 error。
 - 请合理设置抓取间隔并遵守 Linux.do 社区规则。
+
+### 服务镜像的能力边界
+
+`browser` 目标留在仓库里，但下面三层必须分开看 —— 「依赖与文件齐了」不等于「能跑」：
+
+1. **已断言的事实**（`tests/test_core.py::ServiceImageTests`）：
+   镜像的 COPY 覆盖 `service.py` **传递闭包**所需的全部本地模块（闭包从 `service.py`
+   出发，走 `ROOT / "xxx.py"` 子进程调用与本地 import，不是手工清单）；
+   `browser` 目标装 `playwright` + Google Chrome + Xvfb + 中文字体。
+   这两条只证明「文件与依赖声明齐全」，**不证明能跑**。
+2. **未验证**：镜像**从未真实构建过**（本机无 `docker` / `colima` / `podman`，已实测；
+   CI 也只跑语法检查与单测，没有 docker 步骤）；容器内的**有头 Chrome 能否过
+   Cloudflare 未知**，且与 macOS 上的有头 Chrome **不等价**。
+   因此本仓库**不宣称**「镜像能跑 browser 模式」。
+3. **唯一已验证能跑 browser 模式的路径是本机源码运行**：
+   `pip install -r requirements.txt` → `python linux_do_scraper.py --browse`
+   （首次登录，生成 `browser_data/`）→ `SCRAPE_MODE=browser python service.py`。
+
+「补齐浏览器依赖 + 容器内跑通 browser 模式」仍是**待环境决策项**（PoC 未立项）：
+手头没有能执行它的环境（没有 docker），有环境了再开工，这里不作承诺。
 
 ## License
 

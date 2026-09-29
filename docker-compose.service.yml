@@ -14,10 +14,12 @@ services:
       SERVICE_PORT: "8080"
       # 容器内必须监听 0.0.0.0 才能被端口映射转发（绑 127.0.0.1 则映射不到）。
       # 因此读接口默认开鉴权：PROTECT_READ_ENDPOINTS=true + SERVICE_TOKEN。
-      # 两者没同时给定时，/status /topics /hot 会返回 401（/health /ready 不受影响）。
+      # SERVICE_TOKEN 是**必填**（缺/空直接拒绝启动，不是默认空字符串）：
+      # 留空的话 /status /topics /hot 一律 401，而「读鉴权开着」这个信号本身就在
+      # /status 里 —— 于是连它都看不到，/health 却全绿。宁可起不来，也别起一个读不了的服务。
       SERVICE_HOST: "0.0.0.0"
       PROTECT_READ_ENDPOINTS: "${PROTECT_READ_ENDPOINTS:-true}"
-      SERVICE_TOKEN: "${SERVICE_TOKEN:-}"
+      SERVICE_TOKEN: "${SERVICE_TOKEN:?SERVICE_TOKEN 必填：留空会让 /status /topics /hot 一律 401}"
       SCRAPE_INTERVAL_SECONDS: "21600"
       RUN_ON_START: "true"
       SCRAPE_CONTENT: "false"

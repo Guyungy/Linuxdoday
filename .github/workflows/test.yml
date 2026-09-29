@@ -31,5 +31,10 @@ jobs:
             echo "py_compile $file"
             python -m py_compile "$file" || exit 1
           done
+      # AC6.2 import 冒烟：分档的判据在 tests/test_core.py::ImportSmokeTests。
+      # 这里只跑「不需要第三方依赖」的那一档（CI 只装了 requirements-service.txt）；
+      # 依赖重的模块（DrissionPage / playwright / tkinter）由上面的 py_compile 兜住。
+      - name: Import smoke (dependency-free tier)
+        run: python -c "import hot_topics; assert callable(hot_topics.collect)"
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

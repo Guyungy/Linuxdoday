@@ -45,6 +45,8 @@ WARN_PREFIX = "WARN: "
 # /status 里保留的 stderr 尾部长度：够定位，不至于把状态接口撑大。
 MAX_STDERR_KEPT = 2000
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 连续失败时每 N 轮向 stderr 重播一次：既不刷屏，也不至于让长期故障彻底没人看见。
+FAILURE_REANNOUNCE_EVERY = 4
 
 
 def tail(text, limit=MAX_STDERR_KEPT):
@@ -118,16 +120,25 @@ class ScrapeService:
         self.report_hour = max(0, min(23, int(os.environ.get("DAILY_REPORT_HOUR", "8"))))
         self.token = os.environ.get("SERVICE_TOKEN", "").strip()
         self.protect_reads = env_bool("PROTECT_READ_ENDPOINTS", False)
+        # 去重签名：不能在 state["last_error"] 上做判断 —— run_once 每次开头都会把它
+        # 清成 None（「正在跑」期间不该挂着上一轮的错），那会让去重永远失效。
+        self._last_failure_message = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.state = {
             "status": "starting",
             "started_at": utc_now(),
+            # 调度线程存活状态：P2 的故障形态是「服务自称健康、实际已停止抓取」，
+            # /health 靠这两个字段才看得出来。
+            "scheduler_alive": False,
+            "last_tick_at": None,
             "last_started_at": None,
             "last_finished_at": None,
             "last_success_at": None,
             "last_error": None,
+            "last_error_repeat": 0,
+            "consecutive_failures": 0,
             "last_stderr": None,
             "last_new_topics": 0,
             "last_pushed_topics": 0,
@@ -195,6 +206,48 @@ class ScrapeService:
                 command.extend(["--content-limit", str(self.content_limit)])
         return command
 
+    def zero_rows_is_failure(self, count):
+        """P1 服务层兜底：这一轮 0 条要不要判失败。
+
+        只在「browser 模式 + 没指定 `--cats`」时成立 —— 那意味着默认板块全跑完了，
+        十几个板块翻完不可能零新增。指定板块下的 0 条可能是正常结果；
+        rss 模式另有 scraper 自己的 `assert_rows_present` 兜底。
+
+        为什么要在 service 侧再判一次：`last_success_at` 是 **service** 刷的。
+        只在 scraper 里改，等于把这个结论托付给子进程的自觉。
+        """
+        return self.mode == "browser" and not self.categories and count == 0
+
+    def record_failure(self, message, stderr=None):
+        """失败落账：连续失败计数 + 错误去重。
+
+        - `consecutive_failures`：连续失败轮数，成功一轮即清零。
+        - `last_error_repeat`：**同一条**错误连续出现的次数。重复的同一错误不再每轮
+          重播 stderr（否则「每 6 小时一条 error」会变成新的背景噪音），但每
+          FAILURE_REANNOUNCE_EVERY 轮仍重播一次，免得长期故障彻底没人看见。
+        """
+        with self.state_lock:
+            same = self._last_failure_message == message
+            self._last_failure_message = message
+            repeats = self.state.get("last_error_repeat", 0)
+            repeat = repeats + 1 if same else 1
+            consecutive = self.state.get("consecutive_failures", 0) + 1
+            self.state.update({
+                "status": "error",
+                "last_finished_at": utc_now(),
+                "last_error": message,
+                "last_error_repeat": repeat,
+                "consecutive_failures": consecutive,
+                "runs": self.state["runs"] + 1,
+            })
+            if stderr is not None:
+                self.state["last_stderr"] = tail(stderr)
+        if repeat == 1 or repeat % FAILURE_REANNOUNCE_EVERY == 0:
+            suffix = f"，同一错误第 {repeat} 次" if repeat > 1 else ""
+            print(f"[{utc_now()}] 抓取失败（连续 {consecutive} 轮{suffix}）: {message}",
+                  file=sys.stderr, flush=True)
+        return False, message
+
     def run_once(self, trigger="schedule"):
         if not self.lock.acquire(blocking=False):
             return False, "a scrape is already running"
@@ -207,24 +260,23 @@ class ScrapeService:
             )
             if result.returncode != 0:
                 error = (result.stderr or result.stdout or "unknown scraper error")[-4000:]
-                with self.state_lock:
-                    self.state.update({
-                        "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                        "last_stderr": tail(result.stderr), "runs": self.state["runs"] + 1,
-                    })
-                return False, error
+                return self.record_failure(error, result.stderr)
 
             try:
                 rows = json.loads(result.stdout or "[]")
                 if not isinstance(rows, list):
                     raise ValueError("scraper output is not a JSON array")
             except (json.JSONDecodeError, ValueError) as exc:
-                with self.state_lock:
-                    self.state.update({
-                        "status": "error", "last_finished_at": utc_now(), "last_error": str(exc),
-                        "last_stderr": tail(result.stderr), "runs": self.state["runs"] + 1,
-                    })
-                return False, str(exc)
+                return self.record_failure(str(exc), result.stderr)
+
+            if self.zero_rows_is_failure(len(rows)):
+                # browser 模式跑完全部默认板块却 0 条：不写 latest_run.json，
+                # 上一份好数据留着才看得出「停在哪」。
+                return self.record_failure(
+                    "browser 模式跑完全部默认板块却拿到 0 条：按失败处理，"
+                    "不刷新 last_success_at（上一份好数据保留在 latest_run.json）",
+                    result.stderr,
+                )
 
             pushed = 0
             if self.push_to_feishu:
@@ -254,12 +306,7 @@ class ScrapeService:
                 )
                 if push.returncode != 0:
                     error = (push.stderr or push.stdout or "unknown Feishu push error")[-4000:]
-                    with self.state_lock:
-                        self.state.update({
-                            "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                            "last_stderr": tail(push.stderr), "runs": self.state["runs"] + 1,
-                        })
-                    return False, error
+                    return self.record_failure(error, push.stderr)
                 try:
                     push_result = json.loads(PUSH_RESULT_FILE.read_text(encoding="utf-8"))
                     pushed = int(push_result.get("written", 0))
@@ -283,29 +330,19 @@ class ScrapeService:
                     "last_stderr": tail(result.stderr),
                     "last_new_topics": len(rows), "runs": self.state["runs"] + 1,
                     "last_pushed_topics": pushed,
+                    # 成功一轮即清零：/status 里的连续失败数只表示「当前还在坏」。
+                    "consecutive_failures": 0, "last_error_repeat": 0,
                 })
+                self._last_failure_message = None
             if self.should_report_today():
                 self.run_daily_report()
             return True, f"scrape completed: {len(rows)} new topics"
         except subprocess.TimeoutExpired:
-            error = f"scrape timed out after {self.timeout}s"
-            with self.state_lock:
-                self.state.update({
-                    "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                    "runs": self.state["runs"] + 1,
-                })
-            return False, error
+            return self.record_failure(f"scrape timed out after {self.timeout}s")
         except OSError as exc:
             # 部署产物缺文件（例如镜像里没有 COPY daily_report.py）时子进程根本起不来。
             # 这类异常以前直接冒到调度线程，把线程打死而服务仍自称健康。
-            error = f"子进程无法启动（检查部署产物是否完整）: {exc!r}"
-            print(f"[{utc_now()}] {error}", file=sys.stderr, flush=True)
-            with self.state_lock:
-                self.state.update({
-                    "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                    "runs": self.state["runs"] + 1,
-                })
-            return False, error
+            return self.record_failure(f"子进程无法启动（检查部署产物是否完整）: {exc!r}")
         finally:
             self.lock.release()
 
@@ -399,29 +436,37 @@ class ScrapeService:
             return self.run_once(trigger)
         except Exception as exc:  # noqa: BLE001 —— 兜底就是要宽
             message = f"{trigger} 轮次异常（调度线程继续运行）: {exc!r}"
-            print(f"[{utc_now()}] {message}", file=sys.stderr, flush=True)
-            with self.state_lock:
-                self.state.update({
-                    "status": "error", "last_finished_at": utc_now(), "last_error": message,
-                    "runs": self.state["runs"] + 1,
-                })
-            return False, message
+            return self.record_failure(message)
 
     def scheduler(self):
-        if self.should_run_on_start():
-            self.safe_run_once("startup")
-        else:
-            with self.state_lock:
-                self.state["status"] = "idle"
-        while True:
-            due = datetime.now(timezone.utc) + timedelta(seconds=self.interval)
-            with self.state_lock:
-                self.state["next_run_at"] = due.isoformat(timespec="seconds")
-            if not self.wait_until(due):
-                break
-            self.safe_run_once("schedule")
+        """调度线程：任何一轮都不许把它打死，且存活状态必须能被 /health 看到。
+
+        `scheduler_alive` / `last_tick_at` 是 AC2.3 的判据 —— 线程退出（正常停止或
+        异常逃逸）后 /health 立刻不再 ok，故障不再表现为「全绿」。
+        """
         with self.state_lock:
-            self.state["next_run_at"] = None
+            self.state["scheduler_alive"] = True
+            self.state["last_tick_at"] = utc_now()
+        try:
+            if self.should_run_on_start():
+                self.safe_run_once("startup")
+            else:
+                with self.state_lock:
+                    self.state["status"] = "idle"
+            while True:
+                due = datetime.now(timezone.utc) + timedelta(seconds=self.interval)
+                with self.state_lock:
+                    self.state["next_run_at"] = due.isoformat(timespec="seconds")
+                if not self.wait_until(due):
+                    break
+                with self.state_lock:
+                    self.state["last_tick_at"] = utc_now()
+                self.safe_run_once("schedule")
+        finally:
+            # 正常停止与异常逃逸都要落到这里：否则线程死了、/health 还全绿。
+            with self.state_lock:
+                self.state["scheduler_alive"] = False
+                self.state["next_run_at"] = None
 
     def topics(self):
         try:
@@ -455,7 +500,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            self.send_json(200, {"ok": True, "status": SERVICE.snapshot()["status"]})
+            state = SERVICE.snapshot()
+            alive = bool(state["scheduler_alive"])
+            # 仍然返回 200：/health 是只读探针，形状不变（容器探针/脚本靠它）。
+            # 但调度线程不在时 `ok` 必须为 false —— 否则「服务活着、其实已停止抓取」
+            # 这个 P2 故障形态就还是全绿。
+            self.send_json(200, {
+                "ok": alive,
+                "status": state["status"],
+                "scheduler_alive": alive,
+                "last_tick_at": state["last_tick_at"],
+                "consecutive_failures": state["consecutive_failures"],
+            })
         elif path == "/ready":
             state = SERVICE.snapshot()
             ready = state["status"] != "starting"
@@ -503,6 +559,25 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{utc_now()}] {self.address_string()} {fmt % args}", file=sys.stderr, flush=True)
 
 
+def startup_warnings():
+    """启动时的部署姿态警告（非静默）：main() 打印，测试直接断言。
+
+    1. 读接口开了鉴权却没有令牌 → /status /topics /hot 一律 401，
+       而「读鉴权开着」这个信号本身就在 /status 里，于是连它都看不到。
+    2. 对外监听却关掉了读鉴权 → 端口能连上的人都读得到。
+    """
+    messages = []
+    if SERVICE.protect_reads and not SERVICE.token:
+        messages.append("⚠️ PROTECT_READ_ENDPOINTS=true 但 SERVICE_TOKEN 为空："
+                        "/status /topics /hot 将一律返回 401。")
+    elif not SERVICE.protect_reads and resolve_host() not in LOOPBACK_HOSTS:
+        host = resolve_host()
+        messages.append(f"⚠️ SERVICE_HOST={host} 对外监听且 PROTECT_READ_ENDPOINTS=false："
+                        "/status /topics /hot 无鉴权可读。建议设 PROTECT_READ_ENDPOINTS=true"
+                        "（并配置 SERVICE_TOKEN），或改回 127.0.0.1。")
+    return messages
+
+
 def main():
     parser = argparse.ArgumentParser(description="Linuxdoday background service")
     parser.add_argument("--once", action="store_true", help="run one scrape and exit")
@@ -516,13 +591,8 @@ def main():
     # 容器里要发布端口时才显式设 SERVICE_HOST=0.0.0.0（见 docker-compose.service.yml）。
     host = resolve_host()
     port = int(os.environ.get("SERVICE_PORT", "8080"))
-    if SERVICE.protect_reads and not SERVICE.token:
-        print("⚠️ PROTECT_READ_ENDPOINTS=true 但 SERVICE_TOKEN 为空："
-              "/status /topics /hot 将一律返回 401。", file=sys.stderr, flush=True)
-    elif not SERVICE.protect_reads and host not in LOOPBACK_HOSTS:
-        print(f"⚠️ SERVICE_HOST={host} 对外监听且 PROTECT_READ_ENDPOINTS=false："
-              "/status /topics /hot 无鉴权可读。建议设 PROTECT_READ_ENDPOINTS=true"
-              "（并配置 SERVICE_TOKEN），或改回 127.0.0.1。", file=sys.stderr, flush=True)
+    for message in startup_warnings():
+        print(message, file=sys.stderr, flush=True)
     thread = threading.Thread(target=SERVICE.scheduler, daemon=True)
     thread.start()
     server = ThreadingHTTPServer((host, port), Handler)
