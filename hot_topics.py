@@ -102,19 +102,38 @@ def normalize(raw, category_names=None):
 
 
 def collect(pg, periods=("daily", "weekly"), limit=0):
-    """抓多个周期，返回 {period: [topic, ...]} 形态的完整 payload。"""
+    """抓多个周期，返回 {period: [topic, ...], "errors": [...], "partial": bool}。
+
+    关键约定：**空的周期不是结果，是失败**。以前这里逐周期 try/except 后照常
+    save()，于是「会话没拿到数据」会被落盘成 daily: [] —— 一份看起来正常的空榜单，
+    调用方无从分辨「社区今天真的没热帖」和「这轮压根没抓到」。现在：
+      - 每个失败或 0 条的周期都记进 result["errors"]，并置 partial=True；
+      - 榜单照旧带上该周期的空列表，读接口/日报的既有字段形状不变；
+      - 调用方（scraper / main）可用 errors 判断该不该覆盖上一份好数据。
+    """
     category_names = load_category_map(pg)
+    errors = []
     result = {"generated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
     for period in periods:
+        request_failed = False
         try:
             topics = normalize(fetch_period(pg, period), category_names)
         except Exception as exc:
+            errors.append(f"[{period}] 请求失败: {exc}")
             log(f"⚠️ 热榜[{period}]抓取失败: {exc}")
             topics = []
+            request_failed = True
+        if not topics and not request_failed:
+            # 单个周期为空尚可解释，两个周期同时为空基本等价于会话失效。
+            # 每个周期最多记一条错误，len(errors) 才能直接当作失败周期数用。
+            errors.append(f"[{period}] 返回 0 条")
         if limit:
             topics = topics[:limit]
         result[period] = topics
         log(f"热榜[{period}] {len(topics)} 条")
+    if errors:
+        result["errors"] = errors
+        result["partial"] = len(errors) < len(periods)
     return result
 
 
@@ -169,8 +188,16 @@ def main():
     finally:
         ctx.close()
 
+    failures = list(payload.get("errors") or [])
+    if failures and len(failures) >= len(periods):
+        # 全部周期都没拿到数据：不写盘（避免用空榜单覆盖上一份好数据），非零退出。
+        log("❌ 热榜全部周期抓取失败: " + "；".join(failures))
+        log(f"   未覆盖 {HOT_FILE}（保留上一份结果）")
+        sys.exit(1)
     path = save(payload)
     log(f"已写入 {path}")
+    if failures:
+        log(f"⚠️ 部分周期失败（{len(failures)}/{len(periods)}）: " + "；".join(failures))
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
     else:

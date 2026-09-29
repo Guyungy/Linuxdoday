@@ -1,17 +1,41 @@
+import ast
+import contextlib
+import io
 import json
 import os
+import py_compile
+import re
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import hot_topics
 import linux_do_scraper as scraper
 import push_to_feishu as feishu
 import daily_report as report
 import service
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def fake_browser_utils():
+    """替代 browser_utils：真实的那个 import playwright，CI 里没装。"""
+    return SimpleNamespace(
+        start_browser=lambda **kwargs: (SimpleNamespace(close=lambda: None), SimpleNamespace()),
+        check_login=lambda page, timeout=45: True,
+        wait_json_ready=lambda page, slug="develop/4", timeout=90, interval=3: True,
+    )
 
 
 class ScraperTests(unittest.TestCase):
@@ -329,6 +353,434 @@ class DailyReportTests(unittest.TestCase):
         rows, overview, _ = self.collect()
         names = {t["name"]: t["posts"] for t in overview["themes"]}
         self.assertEqual(1, names.get("模型版本/发布"))
+
+
+class ZeroRowDetectionTests(unittest.TestCase):
+    """P1：0 条结果不得被判为成功 —— browser 路径此前没有任何等价断言。"""
+
+    def run_scrape(self, argv, **mocked):
+        stack = [
+            patch.dict("sys.modules", {"browser_utils": fake_browser_utils()}),
+            patch.object(sys, "argv", argv),
+            patch.object(scraper, "start_browser",
+                         return_value=(SimpleNamespace(close=lambda: None), SimpleNamespace())),
+            patch.object(scraper, "check_login", return_value=True),
+        ]
+        for name, value in mocked.items():
+            stack.append(patch.object(scraper, name, return_value=value))
+        for item in stack:
+            item.start()
+        try:
+            # main() 会把飞书行打到 stdout；测试只关心退出码，别污染测试输出。
+            with contextlib.redirect_stdout(io.StringIO()):
+                scraper.main()
+        finally:
+            for item in reversed(stack):
+                item.stop()
+
+    def test_browser_zero_rows_is_not_reported_as_success(self):
+        """对照 test_rss_category_failure_is_not_reported_as_success 的 browser 版。"""
+        with self.assertRaisesRegex(RuntimeError, "0 条"):
+            scraper.assert_rows_present([], "browser")
+        self.assertEqual([{"id": "1"}], scraper.assert_rows_present([{"id": "1"}], "browser"))
+
+    def test_browser_pipeline_exits_nonzero_on_zero_rows(self):
+        with patch.object(scraper.time, "sleep"):
+            with self.assertRaises(SystemExit) as caught:
+                self.run_scrape(
+                    ["linux_do_scraper.py", "--scrape", "--max-pages", "1", "--no-proxy"],
+                    scrape_all={},
+                )
+        self.assertEqual(1, caught.exception.code)
+
+    def test_rss_pipeline_exits_nonzero_on_zero_rows(self):
+        # RSS 已有「任一板块失败即 raise」，但「全部板块都返回 0 条」这条缝隙同样要堵。
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scrape(["linux_do_scraper.py", "--scrape", "--rss", "--no-proxy"],
+                            scrape_all_rss={})
+        self.assertEqual(1, caught.exception.code)
+
+    def test_board_empty_via_json_and_dom_leaves_a_warning(self):
+        """P1 的源头：JSON 失败 + DOM 也没有数据时，必须留下 WARN 现场。"""
+        page = SimpleNamespace(evaluate=unittest.mock.Mock(side_effect=[{"error": "HTTP 403"}] * 2))
+        stderr = io.StringIO()
+        with patch.object(scraper.time, "sleep"), \
+             patch.object(scraper, "scrape_category_dom", return_value=[]), \
+             contextlib.redirect_stderr(stderr):
+            rows = scraper.scrape_category(page, {"n": "开发调优", "u": "/c/develop/4"},
+                                           page_delay=(0, 0))
+        self.assertEqual([], rows)
+        self.assertIn(scraper.WARN_PREFIX, stderr.getvalue())
+        self.assertIn("CF 挑战", stderr.getvalue())
+
+    def test_rows_present_does_not_trip_the_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "topics.json"
+            with patch.object(scraper, "DATA_DIR", directory), \
+                 patch.object(scraper, "CACHE_FILE", str(cache)):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_scrape(
+                        ["linux_do_scraper.py", "--scrape", "--max-pages", "1", "--no-proxy"],
+                        scrape_all={"开发调优": [{"id": "1", "title": "正常一帖"}]},
+                    )
+                self.assertEqual(0, caught.exception.code)
+                self.assertTrue(cache.exists())
+
+
+class WarningSurfacingTests(unittest.TestCase):
+    """P1：热榜/正文的 except 不再静默，现场必须出现在 /status。"""
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    def test_degraded_fetch_reaches_last_error_and_keeps_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = Path(directory) / "latest_run.json"
+            svc = self.build(SCRAPE_MODE="browser")
+            stderr = (
+                "[09:00:01] 启动浏览器（proxy=无，离屏）...\n"
+                "[09:00:02] WARN: 热榜全部周期抓取失败（2/2），保留上一份榜单不覆盖: [daily] 返回 0 条\n"
+                "[09:00:03] WARN: 新帖正文抓取失败（列表已入库，正文缺失）: TimeoutError('x')\n"
+                "[09:00:04] 共抓取 3 条帖子\n"
+            )
+            result = SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]), stderr=stderr)
+            with patch.object(service, "LATEST_FILE", latest), \
+                 patch.object(service.subprocess, "run", return_value=result):
+                ok, _ = svc.run_once("test")
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)
+        self.assertIsNotNone(snapshot["last_success_at"])
+        self.assertIn("热榜全部周期抓取失败", snapshot["last_error"])
+        self.assertIn("新帖正文抓取失败", snapshot["last_error"])
+        self.assertNotIn("WARN:", snapshot["last_error"])       # 前缀已剥离，只留现场
+        self.assertIn("启动浏览器", snapshot["last_stderr"])     # 成功分支不再整段丢弃 stderr
+
+    def test_clean_run_leaves_last_error_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = Path(directory) / "latest_run.json"
+            svc = self.build(SCRAPE_MODE="rss")
+            result = SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]),
+                                     stderr="[09:00:01] 共抓取 1 条帖子\n")
+            with patch.object(service, "LATEST_FILE", latest), \
+                 patch.object(service.subprocess, "run", return_value=result):
+                ok, _ = svc.run_once("test")
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)
+        self.assertIsNone(snapshot["last_error"])
+        self.assertIn("共抓取 1 条帖子", snapshot["last_stderr"])
+
+    def test_hot_collect_records_empty_periods_as_failures(self):
+        page = SimpleNamespace(evaluate=lambda script, period: {"topics": []})
+        with patch.object(hot_topics, "load_category_map", return_value={}):
+            payload = hot_topics.collect(page, ("daily", "weekly"))
+        self.assertEqual([], payload["daily"])
+        self.assertEqual(2, len(payload["errors"]))
+        self.assertFalse(payload["partial"])
+
+    def test_hot_collect_records_http_failure(self):
+        page = SimpleNamespace(evaluate=lambda script, period: {"error": 403})
+        with patch.object(hot_topics, "load_category_map", return_value={}):
+            payload = hot_topics.collect(page, ("daily", "weekly"))
+        self.assertEqual(2, len(payload["errors"]))
+        self.assertIn("403", payload["errors"][0])
+        self.assertFalse(payload["partial"])
+
+    def test_hot_collect_marks_partial_when_one_period_fails(self):
+        def evaluate(script, period):
+            if period == "daily":
+                return {"topics": [{"id": 1, "title": "t", "slug": "s", "posters": []}]}
+            return {"topics": []}
+
+        page = SimpleNamespace(evaluate=evaluate)
+        with patch.object(hot_topics, "load_category_map", return_value={}):
+            payload = hot_topics.collect(page, ("daily", "weekly"))
+        self.assertEqual(1, len(payload["daily"]))
+        self.assertTrue(payload["partial"])
+        self.assertEqual(1, len(payload["errors"]))
+
+    def test_hot_topics_main_keeps_previous_file_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hot_file = Path(directory) / "hot_topics.json"
+            good = {"daily": [{"id": "1"}], "weekly": [{"id": "2"}]}
+            hot_file.write_text(json.dumps(good), encoding="utf-8")
+            payload = {"generated_at": "x", "daily": [], "weekly": [],
+                       "errors": ["[daily] 返回 0 条", "[weekly] 返回 0 条"]}
+            with patch.dict("sys.modules", {"browser_utils": fake_browser_utils()}), \
+                 patch.object(hot_topics, "HOT_FILE", str(hot_file)), \
+                 patch.object(hot_topics, "collect", return_value=payload), \
+                 patch.object(sys, "argv", ["hot_topics.py", "--no-proxy"]):
+                with self.assertRaises(SystemExit) as caught:
+                    hot_topics.main()
+            self.assertEqual(1, caught.exception.code)
+            self.assertEqual(good, json.loads(hot_file.read_text(encoding="utf-8")))
+
+    def test_hot_topics_main_still_saves_on_partial_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hot_file = Path(directory) / "hot_topics.json"
+            payload = {"generated_at": "x", "daily": [{"id": "1"}], "weekly": [],
+                       "errors": ["[weekly] 返回 0 条"], "partial": True}
+            with patch.dict("sys.modules", {"browser_utils": fake_browser_utils()}), \
+                 patch.object(hot_topics, "HOT_FILE", str(hot_file)), \
+                 patch.object(hot_topics, "collect", return_value=payload), \
+                 patch.object(sys, "argv", ["hot_topics.py", "--no-proxy", "--json"]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    hot_topics.main()
+            self.assertEqual(payload, json.loads(hot_file.read_text(encoding="utf-8")))
+
+
+class SchedulerResilienceTests(unittest.TestCase):
+    """P2：单轮异常不得打死调度线程，且失败必须可见。"""
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    def test_missing_daily_report_script_is_visible_not_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            svc = self.build(SCRAPE_MODE="rss", DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+
+            def fake_run(command, **kwargs):
+                if str(command[1]).endswith("daily_report.py"):
+                    # 镜像里没 COPY daily_report.py 时的等价场景
+                    raise FileNotFoundError(2, "No such file or directory", "daily_report.py")
+                return SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]), stderr="")
+
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service, "REPORT_DIR", root / "reports"), \
+                 patch.object(service.subprocess, "run", side_effect=fake_run):
+                ok, _ = svc.run_once("schedule")
+
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)                                    # 抓取本身成功
+        self.assertEqual("idle", snapshot["status"])           # 没被日报失败带崩
+        self.assertIsNotNone(snapshot["last_success_at"])
+        self.assertIn("daily_report.py", snapshot["last_error"])
+
+    def test_scheduler_survives_repeated_run_once_exceptions(self):
+        svc = self.build(SCRAPE_MODE="rss")
+        rounds = []
+
+        def boom(trigger):
+            rounds.append(trigger)
+            if len(rounds) >= 3:
+                svc.stop_event.set()
+            raise FileNotFoundError(2, "No such file or directory", "daily_report.py")
+
+        with patch.object(svc, "should_run_on_start", return_value=True), \
+             patch.object(svc, "run_once", side_effect=boom), \
+             patch.object(svc, "wait_until",
+                          side_effect=lambda due, tick=30: not svc.stop_event.is_set()):
+            svc.scheduler()          # 异常若逃逸出调度循环，这里会直接抛 → 测试失败
+
+        snapshot = svc.snapshot()
+        self.assertEqual(3, len(rounds))                       # 连炸三次仍在继续调度
+        self.assertEqual(3, snapshot["runs"])
+        self.assertEqual("error", snapshot["status"])
+        self.assertIn("FileNotFoundError", snapshot["last_error"])
+        self.assertIn("调度线程继续运行", snapshot["last_error"])
+        self.assertIsNone(snapshot["next_run_at"])             # 退出时清理干净
+
+
+class ReadEndpointAuthTests(unittest.TestCase):
+    """P5：开启读接口鉴权后，无令牌 401、带令牌 200，/run 门禁不受影响。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.patches = [
+            patch.object(service, "LATEST_FILE", root / "latest_run.json"),
+            patch.object(service, "HOT_FILE", root / "hot_topics.json"),
+        ]
+        for item in self.patches:
+            item.start()
+        with patch.dict(os.environ, {"SCRAPE_MODE": "rss", "SERVICE_TOKEN": "s3cret",
+                                     "PROTECT_READ_ENDPOINTS": "true"}):
+            self.svc = service.ScrapeService()
+        self.svc.run_once = unittest.mock.Mock(return_value=(True, "ok"))
+        with self.svc.state_lock:
+            # /ready 只在服务离开 starting 后返回 200；这里直接给一个已就绪的状态。
+            self.svc.state["status"] = "idle"
+        self.patches.append(patch.object(service, "SERVICE", self.svc))
+        self.patches.append(patch.object(service.Handler, "log_message", lambda *args: None))
+        self.patches[-1].start()
+        self.patches[-2].start()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        for item in reversed(self.patches):
+            item.stop()
+        self.tmp.cleanup()
+
+    def call(self, path, token=None, method="GET"):
+        request = urllib.request.Request(self.base + path, method=method)
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_read_endpoints_reject_missing_token(self):
+        for path in ("/status", "/topics", "/hot"):
+            with self.subTest(path=path):
+                self.assertEqual(401, self.call(path)[0])
+
+    def test_read_endpoints_reject_wrong_token(self):
+        self.assertEqual(401, self.call("/status", token="wrong")[0])
+
+    def test_read_endpoints_accept_the_configured_token(self):
+        for path in ("/status", "/topics", "/hot"):
+            with self.subTest(path=path):
+                status, _ = self.call(path, token="s3cret")
+                self.assertEqual(200, status)
+
+    def test_probes_stay_open_without_a_token(self):
+        self.assertEqual(200, self.call("/health")[0])
+        self.assertEqual(200, self.call("/ready")[0])
+
+    def test_manual_run_gate_is_unchanged(self):
+        self.assertEqual(401, self.call("/run", method="POST")[0])
+        self.assertEqual(401, self.call("/run", token="wrong", method="POST")[0])
+        status, body = self.call("/run", token="s3cret", method="POST")
+        self.assertEqual(202, status)
+        self.assertTrue(body["accepted"])
+
+
+class DeploymentDefaultsTests(unittest.TestCase):
+    """P5：默认部署姿态 —— 本机绑回环，容器里读接口默认带鉴权。"""
+
+    def test_default_bind_is_loopback(self):
+        environ = {k: v for k, v in os.environ.items() if k != "SERVICE_HOST"}
+        with patch.dict(os.environ, environ, clear=True):
+            self.assertEqual("127.0.0.1", service.resolve_host())
+
+    def test_explicit_host_wins(self):
+        with patch.dict(os.environ, {"SERVICE_HOST": "0.0.0.0"}):
+            self.assertEqual("0.0.0.0", service.resolve_host())
+
+    def test_compose_protects_reads_and_publishes_loopback_only(self):
+        compose = (REPO_ROOT / "docker-compose.service.yml").read_text(encoding="utf-8")
+        # 容器内必须对外监听才收得到端口映射，因此读接口默认鉴权。
+        self.assertIn('SERVICE_HOST: "0.0.0.0"', compose)
+        self.assertIn('PROTECT_READ_ENDPOINTS: "${PROTECT_READ_ENDPOINTS:-true}"', compose)
+        # 端口只发布到宿主机回环，不对整个局域网开放。
+        self.assertIn('"127.0.0.1:8080:8080"', compose)
+
+    def test_readme_documents_the_shipped_defaults(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertRegex(readme, r"\|\s*`SERVICE_HOST`\s*\|\s*`127\.0\.0\.1`\s*\|")
+        self.assertRegex(readme, r"\|\s*`PROTECT_READ_ENDPOINTS`\s*\|\s*`false`\s*\|")
+
+
+class ServiceImageTests(unittest.TestCase):
+    """P2/P3：镜像必须装得下 service.py 真正用到的那套模块与依赖。
+
+    本机没有 docker（构建条件不具备），所以用**静态闭包**代替构建验证：
+    从 service.py 出发，把「shell out 到的脚本」和「这些脚本 import 到的本地模块」
+    全部走一遍，逐个断言 Dockerfile.service 里有 COPY。P2（缺 daily_report.py）
+    与 P3（缺 browser_utils.py / hot_topics.py）都会被这条断言抓住。
+    真实构建与容器内跑一轮 browser 模式仍然未验证，见交付说明。
+    """
+
+    def local_imports(self, path):
+        """文件里所有顶层 import 的模块名（含函数内的延迟 import）。"""
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        return names
+
+    def required_modules(self):
+        service_source = (REPO_ROOT / "service.py").read_text(encoding="utf-8")
+        needed = {"service.py"}
+        # service.py 用 ROOT / "xxx.py" 的形式起子进程，这些文件不出现在 import 里
+        needed.update(re.findall(r'ROOT\s*/\s*"([\w.]+\.py)"', service_source))
+        frontier = list(needed)
+        while frontier:
+            for name in self.local_imports(REPO_ROOT / frontier.pop()):
+                candidate = f"{name}.py"
+                if (REPO_ROOT / candidate).exists() and candidate not in needed:
+                    needed.add(candidate)
+                    frontier.append(candidate)
+        return needed
+
+    def copied_modules(self, dockerfile):
+        # 先把反斜杠续行接回一行，否则续行上的文件名会被整个漏掉
+        copied = set()
+        for line in dockerfile.replace("\\\n", " ").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("COPY"):
+                copied.update(token for token in stripped.split() if token.endswith(".py"))
+        return copied
+
+    def test_image_copies_every_module_reachable_from_the_service(self):
+        dockerfile = (REPO_ROOT / "Dockerfile.service").read_text(encoding="utf-8")
+        missing = self.required_modules() - self.copied_modules(dockerfile)
+        self.assertEqual(set(), missing, f"镜像缺这些运行期模块: {sorted(missing)}")
+        # 反过来也确认闭包不是空的、确实覆盖了 P2/P3 里点名的文件
+        self.assertTrue({"daily_report.py", "browser_utils.py", "hot_topics.py"}
+                        <= self.required_modules())
+
+    def test_browser_stage_installs_what_browser_mode_needs(self):
+        dockerfile = (REPO_ROOT / "Dockerfile.service").read_text(encoding="utf-8")
+        browser_requirements = (REPO_ROOT / "requirements-browser.txt").read_text(encoding="utf-8")
+        browser_utils = (REPO_ROOT / "browser_utils.py").read_text(encoding="utf-8")
+
+        self.assertIn("FROM base AS browser", dockerfile)
+        self.assertIn("FROM base AS rss", dockerfile)          # 默认目标 = 最后一个 stage
+        self.assertIn("playwright", browser_requirements)
+        self.assertIn("-r requirements-service.txt", browser_requirements)
+        # browser 模式用系统 Chrome（channel="chrome"），所以镜像必须装 Chrome，
+        # 且因为不能用 headless（会被 CF 403），还需要 Xvfb 提供虚拟显示。
+        self.assertIn('channel="chrome"', browser_utils)
+        self.assertIn("google-chrome-stable", dockerfile)
+        self.assertIn("xvfb", dockerfile)
+
+
+class CiCoverageTests(unittest.TestCase):
+    """P6：CI 必须语法检查全仓每个模块，尤其是此前零覆盖的那几个。"""
+
+    PREVIOUSLY_UNCOVERED = [
+        "linux_do_gui.py",
+        "linux_do_headless.py",
+        "linux_do_auto_browse.py",
+        "hot_topics.py",
+        "browser_utils.py",
+        "docker/linux_do_docker.py",
+    ]
+
+    def test_ci_compiles_every_tracked_module(self):
+        workflow = (REPO_ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+        # 覆盖面必须来自仓库（git ls-files），写死清单会再次漏掉新文件。
+        self.assertIn("git ls-files '*.py'", workflow)
+
+        if not (REPO_ROOT / ".git").exists():
+            self.skipTest("非 git 检出（tarball）环境，跳过清单核对")
+        tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "*.py"],
+                                 capture_output=True, text=True, check=True).stdout.split()
+        for name in self.PREVIOUSLY_UNCOVERED:
+            self.assertIn(name, tracked)
+        self.assertGreaterEqual(len(tracked), 13)
+
+        # 本地跑一遍 CI 的等价命令：每个受版本控制的模块都要能编译。
+        for name in tracked:
+            with self.subTest(module=name):
+                self.assertTrue(py_compile.compile(str(REPO_ROOT / name), doraise=True))
 
 
 if __name__ == "__main__":

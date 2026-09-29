@@ -27,6 +27,7 @@ wheels/
 *.ndjson
 *.txt
 !requirements-service.txt
+!requirements-browser.txt
 *.html
 *.png
 *.pyw

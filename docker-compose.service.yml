@@ -3,19 +3,34 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.service
+      # rss（默认，小镜像）或 browser（含 Chrome/playwright/xvfb，只跑 browser 模式才需要）。
+      # 改成 browser 时记得同时把 SCRAPE_MODE 设成 browser。
+      target: rss
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # 只发布到宿主机回环，不对整个局域网开放；需要外部访问再自行改成 "8080:8080"。
+      - "127.0.0.1:8080:8080"
     environment:
       SERVICE_PORT: "8080"
+      # 容器内必须监听 0.0.0.0 才能被端口映射转发（绑 127.0.0.1 则映射不到）。
+      # 因此读接口默认开鉴权：PROTECT_READ_ENDPOINTS=true + SERVICE_TOKEN。
+      # 两者没同时给定时，/status /topics /hot 会返回 401（/health /ready 不受影响）。
+      SERVICE_HOST: "0.0.0.0"
+      PROTECT_READ_ENDPOINTS: "${PROTECT_READ_ENDPOINTS:-true}"
+      SERVICE_TOKEN: "${SERVICE_TOKEN:-}"
       SCRAPE_INTERVAL_SECONDS: "21600"
       RUN_ON_START: "true"
       SCRAPE_CONTENT: "false"
-      SERVICE_TOKEN: "${SERVICE_TOKEN:-}"
+      # browser 模式请改用 target: browser，并解开下面两行
+      # SCRAPE_MODE: "browser"
+      # SCRAPE_MAX_PAGES: "10"
       # SCRAPE_CATEGORIES: "开发调优,前沿快讯"
       # LINUXDO_PROXY: "http://host.docker.internal:7897"
     volumes:
       - linuxdoday-data:/app/data
+      # browser 模式的登录态目录（先在本机跑 `--browse` 登录，或让它自己持久化）
+      # - linuxdoday-browser:/app/browser_data
 
 volumes:
   linuxdoday-data:
+  # linuxdoday-browser:

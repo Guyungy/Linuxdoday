@@ -11,6 +11,11 @@ Two scrape modes (SCRAPE_MODE):
 Only Python's standard library is used by the service itself; the scraper
 subprocess is launched with the same interpreter, so that interpreter must have
 the dependencies of the selected mode installed.
+
+Read endpoints (/status /topics /hot) carry no authentication by default, so the
+default bind address is loopback (SERVICE_HOST=127.0.0.1). Set
+PROTECT_READ_ENDPOINTS=true together with SERVICE_TOKEN before exposing the
+service on a non-loopback address (containers do exactly that).
 """
 
 import argparse
@@ -33,6 +38,40 @@ LATEST_FILE = DATA_DIR / "latest_run.json"
 PENDING_FEISHU_FILE = DATA_DIR / "pending_feishu.json"
 PUSH_RESULT_FILE = DATA_DIR / ".push_result.json"
 HOT_FILE = DATA_DIR / "hot_topics.json"
+
+# 抓取子进程用这个前缀标记「降级但没失败」的现场（热榜/正文抓取失败等）。
+# 见 linux_do_scraper.py 的 WARN_PREFIX，两处必须一致。
+WARN_PREFIX = "WARN: "
+# /status 里保留的 stderr 尾部长度：够定位，不至于把状态接口撑大。
+MAX_STDERR_KEPT = 2000
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def tail(text, limit=MAX_STDERR_KEPT):
+    return (text or "").strip()[-limit:]
+
+
+def extract_warnings(stderr):
+    """从子进程 stderr 里捞出 WARN: 行 —— 成功轮次里唯一能带出降级现场的通道。"""
+    found = []
+    for line in (stderr or "").splitlines():
+        marker = line.find(WARN_PREFIX)
+        if marker == -1:
+            continue
+        message = line[marker + len(WARN_PREFIX):].strip()
+        if message:
+            found.append(message)
+    return found
+
+
+def resolve_host():
+    """监听地址：默认回环。
+
+    /status /topics /hot 默认不带鉴权，绑 0.0.0.0 等于同网段可读。
+    容器里必须显式设 SERVICE_HOST=0.0.0.0（否则端口映射转发不进来），
+    所以容器配方同时把 PROTECT_READ_ENDPOINTS 默认打开。
+    """
+    return os.environ.get("SERVICE_HOST", "127.0.0.1")
 
 
 def atomic_write_json(path, value):
@@ -89,6 +128,7 @@ class ScrapeService:
             "last_finished_at": None,
             "last_success_at": None,
             "last_error": None,
+            "last_stderr": None,
             "last_new_topics": 0,
             "last_pushed_topics": 0,
             "next_run_at": None,
@@ -170,7 +210,7 @@ class ScrapeService:
                 with self.state_lock:
                     self.state.update({
                         "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                        "runs": self.state["runs"] + 1,
+                        "last_stderr": tail(result.stderr), "runs": self.state["runs"] + 1,
                     })
                 return False, error
 
@@ -182,7 +222,7 @@ class ScrapeService:
                 with self.state_lock:
                     self.state.update({
                         "status": "error", "last_finished_at": utc_now(), "last_error": str(exc),
-                        "runs": self.state["runs"] + 1,
+                        "last_stderr": tail(result.stderr), "runs": self.state["runs"] + 1,
                     })
                 return False, str(exc)
 
@@ -217,7 +257,7 @@ class ScrapeService:
                     with self.state_lock:
                         self.state.update({
                             "status": "error", "last_finished_at": utc_now(), "last_error": error,
-                            "runs": self.state["runs"] + 1,
+                            "last_stderr": tail(push.stderr), "runs": self.state["runs"] + 1,
                         })
                     return False, error
                 try:
@@ -231,11 +271,17 @@ class ScrapeService:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             payload = {"generated_at": utc_now(), "trigger": trigger, "count": len(rows), "topics": rows}
             atomic_write_json(LATEST_FILE, payload)
+            # 成功分支此前把 stderr 整段丢弃（只在 returncode!=0 时才用），
+            # 于是抓取器采集到的降级现场（热榜/正文失败）一条也查不到。
+            # 现在：WARN: 行进 last_error，原始 stderr 留在 last_stderr。
+            warnings = extract_warnings(result.stderr)
             with self.state_lock:
                 now = utc_now()
                 self.state.update({
                     "status": "idle", "last_finished_at": now, "last_success_at": now,
-                    "last_error": None, "last_new_topics": len(rows), "runs": self.state["runs"] + 1,
+                    "last_error": "；".join(warnings) if warnings else None,
+                    "last_stderr": tail(result.stderr),
+                    "last_new_topics": len(rows), "runs": self.state["runs"] + 1,
                     "last_pushed_topics": pushed,
                 })
             if self.should_report_today():
@@ -243,6 +289,17 @@ class ScrapeService:
             return True, f"scrape completed: {len(rows)} new topics"
         except subprocess.TimeoutExpired:
             error = f"scrape timed out after {self.timeout}s"
+            with self.state_lock:
+                self.state.update({
+                    "status": "error", "last_finished_at": utc_now(), "last_error": error,
+                    "runs": self.state["runs"] + 1,
+                })
+            return False, error
+        except OSError as exc:
+            # 部署产物缺文件（例如镜像里没有 COPY daily_report.py）时子进程根本起不来。
+            # 这类异常以前直接冒到调度线程，把线程打死而服务仍自称健康。
+            error = f"子进程无法启动（检查部署产物是否完整）: {exc!r}"
+            print(f"[{utc_now()}] {error}", file=sys.stderr, flush=True)
             with self.state_lock:
                 self.state.update({
                     "status": "error", "last_finished_at": utc_now(), "last_error": error,
@@ -273,20 +330,30 @@ class ScrapeService:
             command.append("--card")
         return command
 
+    def _record_report_error(self, message):
+        """日报失败的现场写进 last_error（否则只在 stderr 里划过，没人看得到）。"""
+        print(f"[{utc_now()}] {message}", file=sys.stderr, flush=True)
+        with self.state_lock:
+            self.state["last_error"] = message
+
     def run_daily_report(self):
-        """生成日报；失败只记日志，不影响抓取主流程。"""
+        """生成日报；失败只记现场，不影响抓取主流程，更不允许打死调度线程。"""
         try:
             result = subprocess.run(self.daily_report_command(), cwd=ROOT,
                                     capture_output=True, text=True, timeout=self.timeout,
                                     env=os.environ.copy())
             if result.returncode != 0:
-                print(f"[{utc_now()}] 日报生成失败: {(result.stderr or result.stdout)[-500:]}",
-                      file=sys.stderr, flush=True)
+                self._record_report_error(f"日报生成失败: {tail(result.stderr or result.stdout, 500)}")
                 return False
             print(f"[{utc_now()}] 日报已生成 {result.stdout.strip()[-200:]}", file=sys.stderr, flush=True)
             return True
         except subprocess.TimeoutExpired:
-            print(f"[{utc_now()}] 日报生成超时", file=sys.stderr, flush=True)
+            self._record_report_error(f"日报生成超时（{self.timeout}s）")
+            return False
+        except OSError as exc:
+            # 典型场景：镜像里没有 COPY daily_report.py → FileNotFoundError。
+            self._record_report_error(
+                f"日报进程无法启动（确认 daily_report.py 在部署产物里）: {exc!r}")
             return False
 
     def wait_until(self, due, tick=30):
@@ -321,9 +388,28 @@ class ScrapeService:
         age = (datetime.now(timezone.utc) - generated).total_seconds()
         return age >= self.interval / 2
 
+    def safe_run_once(self, trigger):
+        """调度线程的兜底：任何单轮异常都只记录，绝不让线程退出。
+
+        此前 scheduler() 里两处 run_once 都没有 try/except，而 run_once 只捕获
+        TimeoutExpired。于是 FileNotFoundError / OSError 会一路冒上来终结调度线程：
+        HTTP 线程照常服务、/health 仍返回 ok=true —— 服务看起来活着，实际已停止抓取。
+        """
+        try:
+            return self.run_once(trigger)
+        except Exception as exc:  # noqa: BLE001 —— 兜底就是要宽
+            message = f"{trigger} 轮次异常（调度线程继续运行）: {exc!r}"
+            print(f"[{utc_now()}] {message}", file=sys.stderr, flush=True)
+            with self.state_lock:
+                self.state.update({
+                    "status": "error", "last_finished_at": utc_now(), "last_error": message,
+                    "runs": self.state["runs"] + 1,
+                })
+            return False, message
+
     def scheduler(self):
         if self.should_run_on_start():
-            self.run_once("startup")
+            self.safe_run_once("startup")
         else:
             with self.state_lock:
                 self.state["status"] = "idle"
@@ -333,7 +419,7 @@ class ScrapeService:
                 self.state["next_run_at"] = due.isoformat(timespec="seconds")
             if not self.wait_until(due):
                 break
-            self.run_once("schedule")
+            self.safe_run_once("schedule")
         with self.state_lock:
             self.state["next_run_at"] = None
 
@@ -426,8 +512,17 @@ def main():
         print(message)
         raise SystemExit(0 if ok else 1)
 
-    host = os.environ.get("SERVICE_HOST", "0.0.0.0")
+    # 默认只监听回环：/status /topics /hot 默认无鉴权，绑 0.0.0.0 等于同网段可读。
+    # 容器里要发布端口时才显式设 SERVICE_HOST=0.0.0.0（见 docker-compose.service.yml）。
+    host = resolve_host()
     port = int(os.environ.get("SERVICE_PORT", "8080"))
+    if SERVICE.protect_reads and not SERVICE.token:
+        print("⚠️ PROTECT_READ_ENDPOINTS=true 但 SERVICE_TOKEN 为空："
+              "/status /topics /hot 将一律返回 401。", file=sys.stderr, flush=True)
+    elif not SERVICE.protect_reads and host not in LOOPBACK_HOSTS:
+        print(f"⚠️ SERVICE_HOST={host} 对外监听且 PROTECT_READ_ENDPOINTS=false："
+              "/status /topics /hot 无鉴权可读。建议设 PROTECT_READ_ENDPOINTS=true"
+              "（并配置 SERVICE_TOKEN），或改回 127.0.0.1。", file=sys.stderr, flush=True)
     thread = threading.Thread(target=SERVICE.scheduler, daemon=True)
     thread.start()
     server = ThreadingHTTPServer((host, port), Handler)

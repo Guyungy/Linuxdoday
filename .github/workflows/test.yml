@@ -19,7 +19,17 @@ jobs:
           cache: pip
       - name: Install service dependencies
         run: pip install -r requirements-service.txt
-      - name: Compile and test
+      # 全仓每个受版本控制的 .py 都要过语法检查：此前只编译 4 个服务文件，
+      # linux_do_gui.py（2476 行，全仓最大）、linux_do_headless.py、
+      # linux_do_auto_browse.py、hot_topics.py、browser_utils.py、
+      # docker/linux_do_docker.py 从未被 CI 碰过。
+      # 用 git ls-files 而不是写死清单：新增文件自动纳入，不会再次出现漏网。
+      # 逐个 echo 是为了让 CI 日志本身就能证明「这个文件确实被编译了」。
+      - name: Compile every Python module
         run: |
-          python -m py_compile linux_do_scraper.py service.py push_to_feishu.py fetch_content.py
-          python -m unittest discover -s tests -v
+          git ls-files '*.py' | while IFS= read -r file; do
+            echo "py_compile $file"
+            python -m py_compile "$file" || exit 1
+          done
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

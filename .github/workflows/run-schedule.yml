@@ -1,9 +1,22 @@
 # ================================================================================
-# Linux.do 自动浏览定时任务
+# Linux.do 自动浏览定时任务【已弃用 / LEGACY —— 保留供参考，不建议使用】
 # ================================================================================
 #
+# 保留原因（POLL-64 P6 记录了「过时内容」，这里说明为什么不删）：
+#   - 定时触发早已注释掉，只剩 workflow_dispatch，本工作流不会自己跑，留着不会产生噪音或误通知；
+#   - 它驱动的是 linux_do_headless.py（DrissionPage 路线）。该路线已弃用：
+#     DrissionPage 4.x 与 Chrome 153 不兼容（WebSocket 404 / PageDisconnectedError），
+#     apt 装到的 google-chrome-stable 也早已越过那个版本，所以手动触发大概率会失败；
+#   - 删掉会丢失这段历史的参照（比如仍需在旧 Chrome 上复现登录/浏览行为时），
+#     因此保留原文 + 顶部说明，而不是删文件。
+#
+# 现在该用哪条路：
+#   - 抓数据 + HTTP API  →  service.py（rss 模式开箱即用，browser 模式走 playwright）
+#   - 容器部署           →  根目录 Dockerfile.service / docker-compose.service.yml
+#   - 自动刷帖（NAS）    →  docker/（见 docker/README.md，同属 legacy 但仍在用）
+#
 # 功能：
-#   - 定时自动运行浏览脚本
+#   - 定时自动运行浏览脚本（定时已禁用）
 #   - 支持手动触发
 #   - 自动登录并浏览帖子
 #
@@ -68,6 +81,11 @@ jobs:
     timeout-minutes: 60  # 最长运行 60 分钟
 
     steps:
+      # 先明确喊一声：这条路线已弃用，失败是预期的，别当成新故障排查。
+      - name: Deprecation notice
+        run: |
+          echo "::warning::本工作流驱动的是已弃用的 DrissionPage 路线（与 Chrome 153 不兼容）。抓数据请用 service.py；容器部署见根目录 Dockerfile.service。"
+
       # 检出代码
       - name: Checkout
         uses: actions/checkout@v4

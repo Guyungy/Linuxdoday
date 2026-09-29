@@ -77,6 +77,17 @@ def log(msg):
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
+# 「本轮有降级、但没到失败」的现场标记。service.py 只在 returncode!=0 时才读 stderr，
+# 成功分支会把 stderr 整段丢掉 —— 于是热榜/正文抓失败的证据采集了却查不到。
+# 带此前缀的行由 service.py 捞出来写进 /status 的 last_error。
+WARN_PREFIX = "WARN: "
+
+
+def warn(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {WARN_PREFIX}{msg}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # 浏览器
 # ---------------------------------------------------------------------------
@@ -289,7 +300,13 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
                 page_num -= 1
                 continue
             log(f"  板块[{cat['n']}] JSON 失败({data.get('error') if data else '空'})，回退 DOM 解析")
-            return scrape_category_dom(pg, cat, limit=limit, page_delay=page_delay)
+            dom_rows = scrape_category_dom(pg, cat, limit=limit, page_delay=page_delay)
+            if not dom_rows:
+                # JSON 和 DOM 都没拿到 —— 这正是「0 条被判成功」的源头（CF 挑战未过 /
+                # 登录态失效时，DOM 拿到的是挑战页，解析出 0 行且不报错）。
+                # 单个板块坏掉时整轮仍可能「成功」，所以这里必须留痕。
+                warn(f"板块[{cat['n']}] JSON 与 DOM 均未取到数据（疑似 CF 挑战未过 / 登录态失效）")
+            return dom_rows
 
         topic_list = (data.get("topic_list") or {}).get("topics") or []
         if not topic_list:
@@ -501,6 +518,23 @@ def flatten(result):
             t["category"] = cat_name
             rows.append(t)
     return rows
+
+
+def assert_rows_present(rows, mode):
+    """flatten 之后 0 条 = 抓取失败，不是「今天社区没发新帖」。
+
+    RSS 侧已有等价防护（scrape_all_rss 任一板块失败即 raise）；browser 侧此前
+    没有任何断言，于是「14 个板块翻 10 页、跑满 6.5 分钟、拿回 0 条」也会 exit 0，
+    服务侧据此刷新 last_success_at —— 静默吞掉一个抓取窗口。这里把它钉死：
+    browser 和 rss 都走同一道门，空结果一律非零退出。
+    """
+    if rows:
+        return rows
+    raise RuntimeError(
+        f"抓取结果为 0 条（{mode} 模式）→ 本轮不视为成功，不刷新 last_success_at。"
+        "常见原因：浏览器会话未通过 Cloudflare / 登录态失效 / 全部板块被限流 / "
+        "接口变更 / --cats 未匹配到任何板块。"
+    )
 
 
 def merge_incremental(all_rows):
@@ -721,6 +755,15 @@ def main():
         log(f"每板块最多翻 {max_pages} 页（约 {max_pages * 30} 条）")
         result = scrape_all_rss(cats, limit=args.limit, proxy=proxy, pages=args.rss_pages) if args.rss else scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
         all_rows = flatten(result)
+        try:
+            assert_rows_present(all_rows, "rss" if args.rss else "browser")
+        except RuntimeError as exc:
+            # 非零退出：service.py 的 run_once 只在 returncode!=0 时才认失败，
+            # 也只有这样才不会刷新 last_success_at。
+            log(f"❌ {exc}")
+            if ctx:
+                ctx.close()
+            sys.exit(1)
         if args.total_limit:
             all_rows = all_rows[:args.total_limit]
         rss_contents = {}
@@ -755,7 +798,7 @@ def main():
                 got = 0
                 targets = new_rows[:args.content_limit] if args.content_limit else new_rows
                 if args.content_limit and len(new_rows) > len(targets):
-                    log(f"⚠️ 正文单轮上限 {args.content_limit}，本轮 {len(new_rows)} 条新帖中只抓前 {len(targets)} 条")
+                    warn(f"正文单轮上限 {args.content_limit}，本轮 {len(new_rows)} 条新帖中只抓前 {len(targets)} 条")
                 for row in targets:
                     if args.rss and str(row.get("id")) in rss_contents:
                         content = rss_contents[str(row.get("id"))]
@@ -771,18 +814,28 @@ def main():
                 _sj(CONTENT_FILE, contents)
                 log(f"新帖正文: 抓取 {got}/{len(targets)} 条 → {CONTENT_FILE}")
             except Exception as e:
-                log(f"⚠️ 新帖正文抓取失败（不影响列表入库）: {e}")
+                # 不静默：列表数据仍算成功，但现场要能被 /status 看到。
+                warn(f"新帖正文抓取失败（列表已入库，正文缺失）: {e!r}")
 
         # 可选：官方热榜（/top.json，一次请求，复用当前浏览器会话）
         if args.hot and not args.rss:
+            periods = tuple(p.strip() for p in str(args.hot).split(",") if p.strip()) or ("daily", "weekly")
             try:
                 from hot_topics import collect as _hot_collect, save as _hot_save
-                periods = tuple(p.strip() for p in str(args.hot).split(",") if p.strip())
-                payload = _hot_collect(pg, periods or ("daily", "weekly"))
-                _hot_save(payload)
-                log("热榜已更新: " + ", ".join(f"{p}={len(payload.get(p) or [])}条" for p in periods))
+                payload = _hot_collect(pg, periods)
+                # 部分/全部周期失败：collect 不再把空榜单当结果，errors 里带着现场。
+                failures = list(payload.get("errors") or [])
+                if len(failures) == len(periods):
+                    warn(f"热榜全部周期抓取失败（{len(periods)}/{len(periods)}），"
+                         f"保留上一份榜单不覆盖: " + "；".join(failures))
+                else:
+                    _hot_save(payload)
+                    if failures:
+                        warn(f"热榜部分周期失败（{len(failures)}/{len(periods)}）: " + "；".join(failures))
+                    log("热榜已更新: " + ", ".join(f"{p}={len(payload.get(p) or [])}条" for p in periods))
             except Exception as e:
-                log(f"⚠️ 热榜抓取失败（不影响主流程）: {e}")
+                # 不静默：热榜是附加数据，但失败现场必须留痕（此前被成功分支整段丢弃）。
+                warn(f"热榜抓取失败（列表数据不受影响）: {e!r}")
 
         rows = feishu_rows(new_rows)
         print(json.dumps(rows, ensure_ascii=False))

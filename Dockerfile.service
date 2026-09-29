@@ -1,8 +1,24 @@
-FROM python:3.12-slim
+# Linuxdoday 后台服务镜像。
+#
+# 两个构建目标（stage），按要跑的模式二选一：
+#   docker build -t linuxdoday:rss .                        # 默认目标：只跑 rss 模式
+#   docker build -t linuxdoday:browser --target browser .   # 完整目标：rss + browser 模式
+#
+# 为什么分两个目标而不是一个全量镜像：browser 层要装 Google Chrome（数百 MB），
+# 而 README 里写的 Render / Railway / Fly.io 这类平台对镜像体积敏感 ——
+# 只跑 RSS 的部署不该被迫背上浏览器那几百 MB。
+# 反过来，只给 rss 层会让「镜像装不出线上真实运行的那套配置」（见 POLL-64 P3），
+# 所以 browser 目标必须存在，且必须包含 browser 模式真正用到的每个文件与依赖。
+
+# ---------------------------------------------------------------------------
+# base：解释器、目录、服务脚本、RSS 依赖
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    SERVICE_PORT=8080
+    SERVICE_PORT=8080 \
+    SERVICE_HOST=0.0.0.0
 
 WORKDIR /app
 
@@ -12,7 +28,15 @@ RUN pip install --no-cache-dir -r requirements-service.txt \
     && mkdir -p /app/data \
     && chown -R linuxdoday:linuxdoday /app
 
-COPY --chown=linuxdoday:linuxdoday service.py linux_do_scraper.py fetch_content.py push_to_feishu.py ./
+# service.py 会 shell out 到这些脚本，少 COPY 一个就是运行期「子进程无法启动」：
+#   linux_do_scraper.py   抓取（rss / browser 两种模式）
+#   fetch_content.py      正文回填（SCRAPE_CONTENT=true 时）
+#   push_to_feishu.py     写飞书（PUSH_TO_FEISHU=true 时）
+#   daily_report.py       AI 日报（DAILY_REPORT=true 时）
+#   hot_topics.py         官方热榜（browser 模式下 SCRAPE_HOT 默认 true）
+#   browser_utils.py      browser 模式的 playwright 入口
+COPY --chown=linuxdoday:linuxdoday service.py linux_do_scraper.py fetch_content.py \
+     push_to_feishu.py daily_report.py hot_topics.py browser_utils.py ./
 
 USER linuxdoday
 EXPOSE 8080
@@ -22,3 +46,34 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3)"
 
 CMD ["python", "service.py"]
+
+# ---------------------------------------------------------------------------
+# browser：base + Google Chrome + playwright + Xvfb
+# ---------------------------------------------------------------------------
+FROM base AS browser
+
+USER root
+
+# browser 模式必须用**有头** Chrome（headless 会被 Cloudflare 403），
+# 容器里没有显示器，所以还要 Xvfb 提供虚拟显示，用 xvfb-run 启动（见 CMD）。
+# 中文字体是给日报/正文里的中文渲染兜底。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget gnupg2 xvfb fonts-wqy-zenhei fonts-noto-cjk \
+    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-browser.txt ./
+RUN pip install --no-cache-dir -r requirements-browser.txt
+
+# browser_data/ = playwright 持久化上下文的登录态目录，要可写（挂卷时才好接管）。
+RUN mkdir -p /app/browser_data && chown -R linuxdoday:linuxdoday /app/browser_data
+USER linuxdoday
+
+CMD ["xvfb-run", "-a", "python", "service.py"]
+
+# ---------------------------------------------------------------------------
+# rss：默认目标（最后一个 stage 即默认）—— 只跑 rss 模式的最小镜像
+# ---------------------------------------------------------------------------
+FROM base AS rss

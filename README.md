@@ -6,6 +6,8 @@ Linuxdoday 是一个可部署在 Linux 服务器、NAS、Docker、云主机或�
 
 默认使用 RSS 通道，不需要桌面环境、Chrome 或浏览器自动化；切到 `SCRAPE_MODE=browser` 则改用 playwright 离屏真实 Chrome，可拿到浏览量、回复数等完整指标。服务会定时抓取最新帖子，保存增量缓存，并通过 HTTP API 提供健康状态、运行状态、最新结果和手动触发能力。
 
+> 本仓库有**两套互不相干的 Docker 配方**：根目录这套跑「抓取 + HTTP API 服务」，`docker/` 那套跑「自动刷帖机器人」。用途、Python 版本、依赖都不同，别混用 —— 对照表见[两套 Docker 配方](#两套-docker-配方)。
+
 ## 两种抓取模式
 
 | 模式 | 指标 | 速度 | 依赖 |
@@ -31,7 +33,8 @@ browser 模式每页 30 条，板块列表**本身没有 40 页上限**（实测
 git clone https://github.com/Guyungy/Linuxdoday.git
 cd Linuxdoday
 
-# 为手动触发接口设置一个随机令牌
+# 必填：容器里读接口默认开鉴权（PROTECT_READ_ENDPOINTS=true），
+# 不设这个令牌则 /status /topics /hot 一律 401，只剩 /health /ready 可读。
 export SERVICE_TOKEN="replace-with-a-long-random-token"
 
 docker compose -f docker-compose.service.yml up -d --build
@@ -40,9 +43,14 @@ docker compose -f docker-compose.service.yml up -d --build
 检查服务：
 
 ```bash
+# /health /ready 永远不需要令牌（供 Docker/K8s 探针使用）
 curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/status
-curl http://127.0.0.1:8080/topics
+
+# /status /topics /hot：compose 默认开了 PROTECT_READ_ENDPOINTS，
+# 所以要带同一个 Bearer 令牌
+curl -H "Authorization: Bearer $SERVICE_TOKEN" http://127.0.0.1:8080/status
+curl -H "Authorization: Bearer $SERVICE_TOKEN" http://127.0.0.1:8080/topics
+curl -H "Authorization: Bearer $SERVICE_TOKEN" http://127.0.0.1:8080/hot
 ```
 
 手动触发一次后台抓取：
@@ -51,6 +59,52 @@ curl http://127.0.0.1:8080/topics
 curl -X POST http://127.0.0.1:8080/run \
   -H "Authorization: Bearer $SERVICE_TOKEN"
 ```
+
+### 镜像的两个构建目标
+
+`Dockerfile.service` 拆成两个 stage，按要跑的模式二选一：
+
+| 目标 | 装了什么 | 适用 | 体积 |
+|---|---|---|---|
+| `rss`（默认） | Python 3.12 + `curl_cffi` | 只要 RSS 抓取 + HTTP API | 小 |
+| `browser` | 上面全部 **+ Google Chrome + `playwright` + Xvfb + 中文字体** | 要 `SCRAPE_MODE=browser`（浏览量/回复数/热榜） | 大几百 MB |
+
+```bash
+docker build -t linuxdoday:rss .                        # 默认目标（最后一个 stage）
+docker build -t linuxdoday:browser --target browser .   # 完整目标
+```
+
+browser 目标用 `xvfb-run` 启动：browser 模式必须用**有头** Chrome（headless 会被
+Cloudflare 403），而容器里没有显示器，靠 Xvfb 提供虚拟显示。登录态目录是
+`/app/browser_data`（`docker-compose.service.yml` 里有对应的卷注释）：
+
+- 容器里没有可交互的显示，`--browse` 的人工登录步骤做不了 ——
+  首次登录态请在**有桌面的机器**上跑一次 `python linux_do_scraper.py --browse`，
+  把生成的 `browser_data/` 挂进容器；
+- 之后容器内的定时抓取复用这份登录态，无需再次登录。
+
+拆两个目标而不是合成一个全量镜像，是因为本文件推荐的 Render / Railway / Fly.io
+这类平台对镜像体积敏感，只跑 RSS 的部署不该被迫下载 Chrome。
+
+> CI 只跑语法检查与单测，**不构建镜像**（`test.yml` 里没有 docker 步骤），
+> 所以这两个目标没有自动化构建验证；改完 Dockerfile 请本地 `docker build` 一次。
+
+## 两套 Docker 配方
+
+仓库里有**两套用途完全不同的 Docker 配方**，请按需要选一套：
+
+| | 根目录（本文件） | `docker/`（[docker/README.md](docker/README.md)） |
+|---|---|---|
+| 文件 | `Dockerfile.service` + `docker-compose.service.yml` | `Dockerfile` + `docker-compose.yml` + `.env.example` |
+| 干什么 | 抓取帖子 + HTTP API 服务（数据、状态、手动触发） | 用账号密码自动刷帖/点赞（养号） |
+| Python | 3.12 | 3.11 |
+| 依赖 | `curl_cffi`；browser 目标加 `playwright` + Chrome | `DrissionPage` + `schedule` + Chrome |
+| 入口 | `service.py`（长驻，定时抓取） | `linux_do_docker.py`（长驻，随机时刻刷帖） |
+| 数据 | 命名卷 `linuxdoday-data`（`/app/data`） | 命名卷 `chrome-data`（浏览器登录态） |
+| 典型场景 | 服务器 / NAS / PaaS 上跑数据服务 | 飞牛 NAS 上挂个自动刷帖机器人 |
+
+两者互不依赖，可以同时部署，也可以只用其中一个。**别把两者的 compose 文件互相替换** ——
+环境变量名、镜像目标、卷路径都不一样。
 
 ## 直接运行
 
@@ -83,14 +137,33 @@ python service.py --once
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用 |
-| `GET` | `/ready` | 就绪检查，服务初始化完成后返回 200 |
-| `GET` | `/status` | 当前状态、最近成功时间、运行次数和错误信息 |
-| `GET` | `/topics` | 最近一次运行发现的新增帖子 |
-| `GET` | `/hot` | 官方热榜（`/top.json` 的 daily/weekly/monthly），由抓取轮次写入 |
+| `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用，**永不需要令牌** |
+| `GET` | `/ready` | 就绪检查，服务初始化完成后返回 200，**永不需要令牌** |
+| `GET` | `/status` | 当前状态、最近成功时间、运行次数和错误信息；`PROTECT_READ_ENDPOINTS=true` 时需令牌 |
+| `GET` | `/topics` | 最近一次运行发现的新增帖子；同上需令牌 |
+| `GET` | `/hot` | 官方热榜（`/top.json` 的 daily/weekly/monthly），由抓取轮次写入；同上需令牌 |
 | `POST` | `/run` | 异步触发抓取，需要 Bearer Token |
 
 当没有配置 `SERVICE_TOKEN` 时，`POST /run` 会被禁用，定时任务仍正常运行。
+
+### 读接口的暴露面
+
+`/status` `/topics` `/hot` 本身不带鉴权，因此：
+
+- **默认监听 `127.0.0.1`**（`SERVICE_HOST` 的默认值），本机以外的机器读不到；
+- 一旦对外监听（容器必须这么做），就应当同时设 `PROTECT_READ_ENDPOINTS=true` 和
+  `SERVICE_TOKEN`。两者缺一都会让读接口对能连上端口的人敞开（或缺令牌全 401）。
+  服务启动时会就此打印警告；`docker-compose.service.yml` 已经默认开启鉴权。
+- 健康检查走 `/health` `/ready`，不受影响，容器探针照常工作。
+
+### `/status` 里的失败现场
+
+`/status` 的 `last_error` / `last_stderr` 是排查的入口：
+
+- 一轮抓取**抓到 0 条**会被判为失败（非零退出），不会刷新 `last_success_at` ——
+  否则一个坏掉的抓取窗口会被静默吞掉，表现为「今天社区没发新帖」；
+- 热榜、正文这类**附加数据**抓失败不影响列表入库，但现场会带 `WARN:` 前缀从子进程
+  stderr 传出来，写进 `last_error`（原始 stderr 留在 `last_stderr`）。
 
 ## 配置
 
@@ -98,10 +171,10 @@ python service.py --once
 
 | 环境变量 | 默认值 | 说明 |
 |---|---:|---|
-| `SERVICE_HOST` | `0.0.0.0` | HTTP 监听地址 |
+| `SERVICE_HOST` | `127.0.0.1` | HTTP 监听地址。默认只监听回环；容器里必须设 `0.0.0.0`（否则端口映射转发不进来），见 `docker-compose.service.yml` |
 | `SERVICE_PORT` | `8080` | HTTP 端口 |
-| `SERVICE_TOKEN` | 空 | 手动触发令牌；为空时禁用 `/run` |
-| `PROTECT_READ_ENDPOINTS` | `false` | 是否也用 Bearer Token 保护 `/status` 和 `/topics` |
+| `SERVICE_TOKEN` | 空 | 手动触发令牌；为空时禁用 `/run`。开了 `PROTECT_READ_ENDPOINTS` 后读接口也要它 |
+| `PROTECT_READ_ENDPOINTS` | `false` | 是否也用 Bearer Token 保护 `/status` `/topics` `/hot`。本机默认 false（已绑回环）；`docker-compose.service.yml` 默认 `true` |
 | `SCRAPE_INTERVAL_SECONDS` | `21600` | 抓取间隔，默认 6 小时，最小 60 秒 |
 | `SCRAPE_TIMEOUT_SECONDS` | `1800` | 单次抓取超时 |
 | `RUN_ON_START` | `true` | 服务启动后是否立即抓取 |
@@ -282,12 +355,19 @@ launchctl list | grep linuxdoday
 
 ## Kubernetes / PaaS
 
-使用仓库根目录的 `Dockerfile.service` 构建镜像。容器监听 `8080`，健康检查路径为 `/health`，持久化目录为 `/app/data`。Render、Railway、Fly.io、Kubernetes、群晖 Container Manager 等平台都可以使用同一镜像。
+使用仓库根目录的 `Dockerfile.service` 构建镜像（默认 `rss` 目标；要 browser 模式加 `--target browser`）。容器监听 `8080`，健康检查路径为 `/health`，持久化目录为 `/app/data`。Render、Railway、Fly.io、Kubernetes、群晖 Container Manager 等平台都可以使用同一镜像。
 
 ## 说明
 
 - RSS 通道每个板块通常返回最新约 25 条，包含标题、作者、发布时间和首帖正文，但没有浏览量、回复数等完整指标。
-- 浏览器版脚本仍保留用于本地完整抓取，但不属于后台服务镜像，也不会被 Docker 安装。
+- 服务镜像的 `browser` 目标会带上 `playwright` 与 Chrome，可跑 browser 模式；
+  `linux_do_gui.py` / `linux_do_headless.py` / `linux_do_auto_browse.py` 这几个
+  桌面/DrissionPage 脚本仍不随镜像发布。
+- DrissionPage 路线（`linux_do_headless.py` 等）已弃用：4.x 与 Chrome 153 不兼容
+  （WebSocket 404），`.github/workflows/run-schedule.yml` 保留但已标注为 legacy，
+  且定时触发早已禁用。抓数据请用 `service.py`。
+- **0 条抓取结果 = 失败**：一轮跑完一条都没拿到会以非零退出，不会刷新 `last_success_at`。
+  判断依据是「14 个板块翻完不可能零新增」，而不是「可能没事」。
 - 请合理设置抓取间隔并遵守 Linux.do 社区规则。
 
 ## License

@@ -1,0 +1,10 @@
+# browser 模式（SCRAPE_MODE=browser）的依赖 = rss 依赖 + playwright。
+#
+# 注意两点：
+#   1. browser_utils.py 用 channel="chrome"，即**系统已安装的 Google Chrome**，
+#      不是 playwright bundled chromium —— 所以还要在镜像里装 google-chrome-stable
+#      （见 Dockerfile.service 的 browser stage），单装本文件不够。
+#   2. 单独拆一个文件是为了不拖慢 CI：test.yml 只装 requirements-service.txt，
+#      跑单测不需要 playwright。
+-r requirements-service.txt
+playwright>=1.40.0
