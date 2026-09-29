@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 BASE = "https://linux.do"
 PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
@@ -151,14 +151,18 @@ def load_json(path, default):
 
 
 def save_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
+    """原子写：先写临时文件再替换，避免与定时任务并发时读到半截 JSON。"""
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(temporary, path)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true", help="全量回填（重抓已有正文的）")
     ap.add_argument("--limit", type=int, default=0, help="最多抓 N 条（0=不限）")
+    ap.add_argument("--recent-days", type=int, default=0, help="只补最近 N 天发布的帖子（0=不限）")
     ap.add_argument("--dry-run", action="store_true", help="只统计不抓取")
     ap.add_argument("--no-proxy", action="store_true", help="不走代理")
     ap.add_argument("--headless", action="store_true", help="无头模式")
@@ -173,7 +177,19 @@ def main():
         todo = rows
     else:
         todo = [r for r in rows if str(r.get("id")) not in contents]
-    log(f"待抓正文 {len(todo)} 条" + ("（全量回填）" if args.all else "（增量补全）"))
+
+    if args.recent_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.recent_days)
+        def _created(row):
+            try:
+                return datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        todo = [r for r in todo if (_created(r) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+        todo.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)  # 新的优先
+
+    log(f"待抓正文 {len(todo)} 条" + ("（全量回填）" if args.all else "（增量补全）")
+        + (f"，限定最近 {args.recent_days} 天" if args.recent_days else ""))
 
     if args.dry_run:
         log("dry-run 结束")
