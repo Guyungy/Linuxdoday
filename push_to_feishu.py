@@ -34,7 +34,9 @@ BATCH = 200  # lark-cli 单次最大 200
 # 命名 profile 见 ~/.lark-cli/config.json（config init --name claw）。
 LARK_PROFILE = os.environ.get("LARK_PROFILE", "claw")
 CACHE_FILE = Path(__file__).resolve().parent / "data" / "feishu_topic_ids.json"
+CONTENT_FILE = Path(__file__).resolve().parent / "data" / "topic_content.json"
 CACHE_TTL = max(0, int(os.environ.get("FEISHU_ID_CACHE_SECONDS", "86400")))
+MAX_CONTENT_CHARS = 50000  # 飞书文本字段上限 10 万字符，留足余量
 
 
 def atomic_write_json(path, value):
@@ -204,14 +206,107 @@ def push(base_token, table, rows, dry_run=False, known_ids=None):
     return written
 
 
+def topic_record_map(base_token, table, limit=2000):
+    """返回 {Topic ID: (record_id, 已有正文?)}；用 ndjson 产物读取，避免解析 markdown 矩阵。"""
+    mapping = {}
+    offset = 0
+    while True:
+        cmd = [
+            "lark-cli", "--profile", LARK_PROFILE, "base", "+record-list",
+            "--base-token", base_token,
+            "--table-id", table,
+            "--field-id", "Topic ID",
+            "--field-id", "正文",
+            "--format", "ndjson",
+            "--limit", str(limit),
+            "--offset", str(offset),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"读取表记录失败: {(r.stderr or r.stdout)[:300]}")
+        manifest = json.loads(r.stdout)
+        count = 0
+        record_file = manifest.get("record_file")
+        if record_file:
+            with open(record_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    count += 1
+                    tid, rid = rec.get("Topic ID"), rec.get("record_id")
+                    if tid and rid:
+                        mapping[str(tid)] = (rid, bool(rec.get("正文")))
+        if not manifest.get("has_more"):
+            break
+        offset = manifest.get("next_offset", offset + max(count, 1))
+    return mapping
+
+
+def sync_content(base_token, table, contents, dry_run=False):
+    """把本地正文更新到表中已存在的记录；已有正文的行跳过（幂等、可重复跑）。"""
+    mapping = topic_record_map(base_token, table)
+    print(f"  表中记录 {len(mapping)} 条")
+    updates, missing, filled = {}, 0, 0
+    for tid, payload in contents.items():
+        entry = mapping.get(str(tid))
+        if not entry:
+            missing += 1
+            continue
+        record_id, has_content = entry
+        if has_content:
+            filled += 1
+            continue
+        text = ((payload or {}).get("content") or "").strip()
+        if not text:
+            continue
+        updates[record_id] = {"正文": text[:MAX_CONTENT_CHARS]}
+    print(f"  待更新 {len(updates)} 条（表中无此帖 {missing}，已有正文跳过 {filled}）")
+    if dry_run or not updates:
+        return 0
+
+    payload_path = Path(__file__).resolve().parent / "data" / ".content_update.json"
+    items = list(updates.items())
+    done = 0
+    for i in range(0, len(items), BATCH):
+        chunk = dict(items[i:i + BATCH])
+        payload_path.write_text(json.dumps({"update_records": chunk}, ensure_ascii=False), encoding="utf-8")
+        cmd = [
+            "lark-cli", "--profile", LARK_PROFILE, "base", "+record-batch-update",
+            "--base-token", base_token,
+            "--table-id", table,
+            "--json", f"@data/{payload_path.name}",
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                           cwd=str(Path(__file__).resolve().parent))
+        if r.returncode != 0:
+            print(f"  ❌ 第 {i//BATCH+1} 批更新失败: {(r.stderr or r.stdout)[:400]}", file=sys.stderr)
+            break
+        done += len(chunk)
+        print(f"  ✅ 已更新正文 {done}/{len(items)} 条")
+    payload_path.unlink(missing_ok=True)
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-token", default=DEFAULT_BASE_TOKEN)
     ap.add_argument("--table", default=DEFAULT_TABLE)
     ap.add_argument("--file", default="", help="从本地 JSON 文件读取")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--sync-content", action="store_true",
+                    help="把 data/topic_content.json 的正文更新到表中已有记录（不新建行）")
     ap.add_argument("--result-file", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.sync_content:
+        contents = load_from_file(str(CONTENT_FILE)) if CONTENT_FILE.exists() else {}
+        print(f"本地正文 {len(contents)} 条 → 同步到 [{args.table}]")
+        updated = sync_content(args.base_token, args.table, contents, dry_run=args.dry_run)
+        if args.result_file:
+            atomic_write_json(Path(args.result_file), {"content_updated": updated})
+        return
 
     if args.file:
         raw = load_from_file(args.file)

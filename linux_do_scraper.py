@@ -19,6 +19,8 @@ linux_do_scraper.py — Linux.do 帖子数据抓取器
   python linux_do_scraper.py --scrape                     # 抓取（默认全部板块）
   python linux_do_scraper.py --scrape --cats 开发调优,前沿快讯
   python linux_do_scraper.py --scrape --limit 50          # 每板块最多 50 条
+  python linux_do_scraper.py --scrape --max-pages 10      # 每板块翻 10 页（约 300 条）
+  python linux_do_scraper.py --scrape --full              # 每板块翻到 API 上限（约 40+ 页）
   python linux_do_scraper.py --scrape --no-proxy          # 不走代理
   python linux_do_scraper.py --scrape --json-only         # 只输出飞书插入 JSON，不落盘
   python linux_do_scraper.py --scrape --rss               # 无浏览器，每板块最新约 25 条
@@ -62,7 +64,11 @@ CATS = [
     {"n": "搞七捻三", "u": "/c/gossip/11", "e": True},
     {"n": "社区孵化", "u": "/c/incubator/102", "e": False},
     {"n": "虫洞广场", "u": "/c/square/110", "e": True},
-    {"n": "运营反馈", "u": "/c/feedback/2", "e": False},
+    {"n": "运营反馈", "u": "/c/feedback/2", "e": True},
+    {"n": "活动", "u": "/c/activity/30", "e": True},
+    {"n": "公告", "u": "/c/announcement/49", "e": False},
+    {"n": "悬赏", "u": "/c/bounty/123", "e": False},
+    {"n": "模板", "u": "/c/template/124", "e": False},
 ]
 
 
@@ -141,7 +147,15 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=Non
     client = session or curl_requests
     response = None
     for attempt in range(1, retries + 1):
-        response = client.get(url, **kwargs)
+        try:
+            response = client.get(url, **kwargs)
+        except Exception as exc:
+            if attempt >= retries:
+                raise RuntimeError(f"RSS 请求失败: {url}: {exc}") from exc
+            delay = min(60, (2 ** (attempt - 1)) * 5 + random.uniform(0, 2))
+            log(f"  RSS 网络错误，{delay:.1f}s 后重试 ({attempt}/{retries}): {exc}")
+            time.sleep(delay)
+            continue
         if response.status_code == 200:
             break
         if attempt < retries:
@@ -157,6 +171,8 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=Non
         raise RuntimeError(f"RSS 请求失败: HTTP {status}")
 
     root = ElementTree.fromstring(response.content)
+    if root.find("./channel") is None:
+        raise RuntimeError(f"RSS 响应不是有效的 RSS feed: {url}")
     dc_creator = "{http://purl.org/dc/elements/1.1/}creator"
     discourse = "{http://www.discourse.org/}"
     topics = []
@@ -195,10 +211,12 @@ def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
         raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
 
     result = {}
+    failures = []
     with curl_requests.Session() as session:
-        for cat in cats:
+        for cat_index, cat in enumerate(cats):
             log(f"无浏览器抓取板块: {cat['n']} ({cat['u']}.rss)")
             topics = []
+            seen = set()
             for page in range(max(1, pages)):
                 try:
                     remaining = limit - len(topics) if limit else 0
@@ -209,16 +227,23 @@ def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
                     )
                     if not page_topics:
                         break
-                    topics.extend(page_topics)
+                    fresh = [topic for topic in page_topics if topic["id"] not in seen]
+                    topics.extend(fresh)
+                    seen.update(topic["id"] for topic in fresh)
+                    if not fresh:
+                        break
                     if page + 1 < pages:
                         time.sleep(random.uniform(4, 7))
                 except Exception as exc:
-                    # 后续页被限流时，保留该板块已抓到的前几页。
-                    log(f"  ⚠️ 板块[{cat['n']}] 第{page + 1}页失败，保留已抓 {len(topics)} 条: {exc}")
+                    failures.append(f"{cat['n']} 第{page + 1}页: {exc}")
+                    log(f"  ⚠️ 板块[{cat['n']}] 第{page + 1}页失败: {exc}")
                     break
             result[cat["n"]] = topics
             log(f"  → 板块[{cat['n']}] 共 {len(result[cat['n']])} 条")
-            time.sleep(random.uniform(4, 7))
+            if cat_index + 1 < len(cats):
+                time.sleep(random.uniform(4, 7))
+    if failures:
+        raise RuntimeError("RSS 抓取不完整: " + "; ".join(failures))
     return result
 
 
@@ -231,7 +256,7 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
     用 /c/<slug>.json 的 JSON API，page=N 分页，字段结构化（作者/回复/浏览/时间/分类）。
     若 JSON 失败则回退到 DOM 解析。
     """
-    slug = cat["u"].rstrip("/").split("/")[-1]
+    category_path = cat["u"].rstrip("/")
     topics = []
     seen = set()
     page_num = 0
@@ -244,15 +269,15 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
         # 浏览器内 fetch 同源 JSON（带 cookie 绕过 CF）
         data = pg.evaluate("""
         async (args) => {
-            const {slug, page} = args;
+            const {categoryPath, page} = args;
             try {
-                const url = "/c/" + slug + ".json?page=" + page;
+                const url = categoryPath + ".json?page=" + page;
                 const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}});
                 if (!r.ok) return {error: "HTTP " + r.status};
                 return await r.json();
             } catch(e) { return {error: String(e)}; }
         }
-        """, {"slug": slug, "page": page_num - 1})
+        """, {"categoryPath": category_path, "page": page_num - 1})
 
         if not data or data.get("error"):
             if not retried:
@@ -524,8 +549,10 @@ def merge_incremental(all_rows):
         old[rid] = merged_r
 
     merged = list(old.values()) + new_rows
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+    temporary = CACHE_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=1)
+    os.replace(temporary, CACHE_FILE)
     return new_rows, merged
 
 
@@ -617,9 +644,12 @@ def main():
     ap.add_argument("--rss-pages", type=int, default=1, help="RSS 每板块抓取页数（默认1）")
     ap.add_argument("--recent", action="store_true", help="近期模式：每板块只抓前3页(约90条)，默认开启")
     ap.add_argument("--full", action="store_true", help="全量模式：抓每个板块全部分页")
+    ap.add_argument("--max-pages", type=int, default=0, help="浏览器模式每板块最多翻页数（默认3，--full 等价于 40）")
     ap.add_argument("--no-proxy", action="store_true", help="不使用代理")
     ap.add_argument("--json-only", action="store_true", help="只输出飞书插入 JSON，不落盘")
-    ap.add_argument("--content", action="store_true", help="新帖同时抓正文（存本地 topic_content.json）")
+    ap.add_argument("--content", action="store_true", help="新帖同时抓正文（存本地 topic_content.json，随行写入飞书）")
+    ap.add_argument("--content-limit", type=int, default=0, help="单轮最多抓 N 条正文（0=不限，防止大轮次超时）")
+    ap.add_argument("--hot", nargs="?", const="daily,weekly", default="", help="同时抓官方热榜（daily,weekly,monthly），写入 data/hot_topics.json")
     ap.add_argument("--headless", action="store_true", help="无头模式")
     ap.add_argument("--show-browser", action="store_true", help="显示浏览器窗口（默认离屏，不干扰桌面）")
     ap.add_argument("--rss", action="store_true", help="无浏览器模式；每板块最新约25条，不含浏览/回复数")
@@ -633,6 +663,8 @@ def main():
         ap.error("--rss 不能与 --browse 同时使用")
     if args.rss and args.full:
         ap.error("RSS 只提供近期帖子；--full 需要浏览器模式")
+    if args.rss and args.max_pages:
+        ap.error("RSS 不支持分页深度设置；--max-pages 需要浏览器模式")
 
     proxy = None if args.no_proxy else PROXY_DEFAULT
     ctx = pg = None
@@ -679,11 +711,14 @@ def main():
                 log("⚠️ CF 未就绪，仍继续尝试（失败会回退 DOM 解析）")
 
         log(f"开始抓取 {len(cats)} 个板块...")
-        # 模式：--full 全量分页；--recent 或默认 → 每板块前3页（近期活跃）
+        # 深度：--full=40 页；--max-pages N 显式指定；否则默认前 3 页（近期活跃）
         if args.full:
             max_pages = 40
+        elif args.max_pages:
+            max_pages = max(1, args.max_pages)
         else:
             max_pages = 3
+        log(f"每板块最多翻 {max_pages} 页（约 {max_pages * 30} 条）")
         result = scrape_all_rss(cats, limit=args.limit, proxy=proxy, pages=args.rss_pages) if args.rss else scrape_all(pg, cats, limit=args.limit, max_pages=max_pages)
         all_rows = flatten(result)
         if args.total_limit:
@@ -712,13 +747,16 @@ def main():
             if content:
                 row["content"] = content
 
-        # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json，不进飞书表）
+        # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json 并随行写飞书）
         if args.content and new_rows:
             try:
                 from fetch_content import fetch_content as _fc, load_json as _lj, save_json as _sj, CONTENT_FILE
                 contents = _lj(CONTENT_FILE, {})
                 got = 0
-                for row in new_rows:
+                targets = new_rows[:args.content_limit] if args.content_limit else new_rows
+                if args.content_limit and len(new_rows) > len(targets):
+                    log(f"⚠️ 正文单轮上限 {args.content_limit}，本轮 {len(new_rows)} 条新帖中只抓前 {len(targets)} 条")
+                for row in targets:
                     if args.rss and str(row.get("id")) in rss_contents:
                         content = rss_contents[str(row.get("id"))]
                         res = {"content": content, "author_raw": row.get("author", ""),
@@ -731,9 +769,20 @@ def main():
                         row["content"] = res.get("content", "")
                         got += 1
                 _sj(CONTENT_FILE, contents)
-                log(f"新帖正文: 抓取 {got}/{len(new_rows)} 条 → {CONTENT_FILE}")
+                log(f"新帖正文: 抓取 {got}/{len(targets)} 条 → {CONTENT_FILE}")
             except Exception as e:
                 log(f"⚠️ 新帖正文抓取失败（不影响列表入库）: {e}")
+
+        # 可选：官方热榜（/top.json，一次请求，复用当前浏览器会话）
+        if args.hot and not args.rss:
+            try:
+                from hot_topics import collect as _hot_collect, save as _hot_save
+                periods = tuple(p.strip() for p in str(args.hot).split(",") if p.strip())
+                payload = _hot_collect(pg, periods or ("daily", "weekly"))
+                _hot_save(payload)
+                log("热榜已更新: " + ", ".join(f"{p}={len(payload.get(p) or [])}条" for p in periods))
+            except Exception as e:
+                log(f"⚠️ 热榜抓取失败（不影响主流程）: {e}")
 
         rows = feishu_rows(new_rows)
         print(json.dumps(rows, ensure_ascii=False))
