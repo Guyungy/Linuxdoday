@@ -139,7 +139,7 @@ python service.py --once
 |---|---|---|
 | `GET` | `/health` | 存活检查，供 Docker/Kubernetes 使用，**永不需要令牌** |
 | `GET` | `/ready` | 就绪检查，服务初始化完成后返回 200，**永不需要令牌** |
-| `GET` | `/status` | 当前状态、最近成功时间、运行次数和错误信息；`PROTECT_READ_ENDPOINTS=true` 时需令牌 |
+| `GET` | `/status` | 当前状态、最近成功时间、运行次数、错误信息和完整 stderr 的落点；`PROTECT_READ_ENDPOINTS=true` 时需令牌 |
 | `GET` | `/topics` | 最近一次运行发现的新增帖子；同上需令牌 |
 | `GET` | `/hot` | 官方热榜（`/top.json` 的 daily/weekly/monthly），由抓取轮次写入；同上需令牌 |
 | `POST` | `/run` | 异步触发抓取，需要 Bearer Token |
@@ -164,6 +164,13 @@ python service.py --once
   否则一个坏掉的抓取窗口会被静默吞掉，表现为「今天社区没发新帖」；
 - 热榜、正文这类**附加数据**抓失败不影响列表入库，但现场会带 `WARN:` 前缀从子进程
   stderr 传出来，写进 `last_error`（原始 stderr 留在 `last_stderr`）。
+- `last_error` / `last_stderr` 都只留**尾部**（4000 / 2000 字符）。长轮次跑满时被切掉的
+  正是最早几个板块的行，所以每轮的 **完整** stderr 另落一份 `data/scrape_stderr.log`
+  （一字不截，`/status` 里的 `stderr_log_file` 是落点、`last_stderr_bytes` 是它的字节数）。
+- 轮次超时是**墙钟**口径：`SCRAPE_TIMEOUT_SECONDS` 由主进程按墙钟（`time.time`）计时，
+  到点直接 kill 子进程并按超时收口。macOS 合盖休眠会让「进程内计时」停走 —— 单调钟
+  口径下 3600 秒的上限可能永远够不到（实测出现过一轮跨 5h32m 墙钟仍活着）；换成墙钟后
+  合盖期间的抓取会在**唤醒瞬间**判超时失败，而不是无限挂。
 
 ## 配置
 
@@ -175,8 +182,8 @@ python service.py --once
 | `SERVICE_PORT` | `8080` | HTTP 端口 |
 | `SERVICE_TOKEN` | 空 | 手动触发令牌；为空时禁用 `/run`。开了 `PROTECT_READ_ENDPOINTS` 后读接口也要它 |
 | `PROTECT_READ_ENDPOINTS` | `false` | 是否也用 Bearer Token 保护 `/status` `/topics` `/hot`。本机默认 false（已绑回环）；`docker-compose.service.yml` 默认 `true` |
-| `SCRAPE_INTERVAL_SECONDS` | `21600` | 抓取间隔，默认 6 小时，最小 60 秒 |
-| `SCRAPE_TIMEOUT_SECONDS` | `1800` | 单次抓取超时 |
+| `SCRAPE_INTERVAL_SECONDS` | `21600` | 抓取间隔，默认 6 小时，最小 60 秒。**按轮次起点顺延**：一轮跑了多久都只从起点算下一轮，节奏不被慢轮次推散 |
+| `SCRAPE_TIMEOUT_SECONDS` | `1800` | 单次抓取超时，**墙钟口径**：到点 kill 子进程并按超时收口（合盖休眠期间墙钟照走，唤醒瞬间判定，不多等） |
 | `RUN_ON_START` | `true` | 服务启动后是否立即抓取 |
 | `SCRAPE_MODE` | `rss` | `rss` 或 `browser`；`browser` 需要 `playwright` 与图形会话 |
 | `SCRAPE_MAX_PAGES` | `0` | `browser` 模式每板块翻页数；0 = 默认 3 页（约 90 条），`--full` 等价 40 页 |

@@ -46,9 +46,96 @@ WARN_PREFIX = "WARN: "
 MAX_STDERR_KEPT = 2000
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# 每轮子进程 stderr 的**完整**留档（POLL-78 追加交付物）。
+# /status 里的 last_error / last_stderr 都是 tail() 出来的（4000 / 2000），长轮次
+# 跑满时最早几个板块的行会被切掉 —— 判据 A1/A3 因此只能读成下界。这份文件不截断。
+# （.gitignore 里有 *.log，落盘不会进版本库。）
+STDERR_LOG_FILE = DATA_DIR / "scrape_stderr.log"
+
+# 子进程 deadline 的墙钟轮询间隔：唤醒后最多滞后一个 tick 就判定超时。
+DEADLINE_TICK_SECONDS = 5.0
+
 
 def tail(text, limit=MAX_STDERR_KEPT):
     return (text or "").strip()[-limit:]
+
+
+def atomic_write_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text or "", encoding="utf-8")
+    temporary.replace(path)
+
+
+def kill_quietly(process):
+    """kill 掉子进程；已经退出/还没起来都算无事发生。"""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def run_with_wall_clock_deadline(command, timeout, *, env=None, input_text=None,
+                                 cwd=None, tick=DEADLINE_TICK_SECONDS):
+    """按**墙钟** deadline 跑子进程：到点 kill，按超时收口。
+
+    为什么不能用 subprocess.run(timeout=)：CPython 拿 time.monotonic 计时，而
+    macOS 合盖休眠期间单调钟是**停走**的 —— 2026-09-29T20:11Z 那一轮墙钟跑了
+    5h32m54s，进程内只累计了 123s，于是 SCRAPE_TIMEOUT_SECONDS=3600 永远够不到，
+    服务一直挂在「抓取中」。
+
+    这里主线程按墙钟（time.time，CLOCK_REALTIME，休眠期间照走）算 deadline，每次
+    只把「剩余墙钟」交给等待：唤醒后第一眼就判定超时，不按剩余时间续命。子进程的
+    阻塞式通信（含 stdin 写入）放到工作线程，主线程不阻塞在管道上。
+    """
+    if cwd is None:
+        cwd = ROOT
+    outcome = {}
+    finished = threading.Event()
+
+    def worker():
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            outcome["process"] = process
+            stdout, stderr = process.communicate(input_text)
+            outcome["result"] = subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr)
+        except BaseException as exc:  # noqa: BLE001 —— 原样交回调用方判断（OSError 等）
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            kill_quietly(outcome.get("process"))
+            worker_thread.join(5)
+            kill_quietly(outcome.get("process"))  # 起得比 deadline 还慢的极端情况
+            result = outcome.get("result")
+            raise subprocess.TimeoutExpired(
+                command, timeout,
+                output=getattr(result, "stdout", None),
+                stderr=getattr(result, "stderr", None),
+            )
+        if finished.wait(min(tick, remaining)):
+            break
+    worker_thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
 
 
 def extract_warnings(stderr):
@@ -121,6 +208,8 @@ class ScrapeService:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
+        # 本轮抓取的墙钟起点（调度按它顺延 next_run_at，见 scheduler）
+        self.round_started = None
         self.state = {
             "status": "starting",
             "started_at": utc_now(),
@@ -129,6 +218,7 @@ class ScrapeService:
             "last_success_at": None,
             "last_error": None,
             "last_stderr": None,
+            "last_stderr_bytes": 0,
             "last_new_topics": 0,
             "last_pushed_topics": 0,
             "next_run_at": None,
@@ -168,6 +258,8 @@ class ScrapeService:
             "feishu_push_enabled": self.push_to_feishu,
             "manual_run_enabled": bool(self.token),
             "read_auth_enabled": self.protect_reads,
+            # 完整 stderr 的落点：last_error / last_stderr 都是尾部，头部只在这里。
+            "stderr_log_file": os.path.relpath(STDERR_LOG_FILE, ROOT),
         })
         return result
 
@@ -195,16 +287,42 @@ class ScrapeService:
                 command.extend(["--content-limit", str(self.content_limit)])
         return command
 
+    def keep_full_stderr(self, stderr, stdout=""):
+        """把子进程 stderr 整段落盘（stderr 为空时退回 stdout）。
+
+        /status 只留尾部（last_error 4000 / last_stderr 2000）；长轮次跑满时被切掉的
+        正是最早几个板块的行。这份文件一字不截，只补证据留存、不改抓取行为。
+        """
+        text = stderr or stdout or ""
+        try:
+            atomic_write_text(STDERR_LOG_FILE, text)
+        except OSError as exc:
+            # 落盘失败（磁盘满 / 只读挂载）不能连累抓取本身。
+            print(f"[{utc_now()}] 完整 stderr 落盘失败: {exc!r}", file=sys.stderr, flush=True)
+            return 0
+        with self.state_lock:
+            self.state["last_stderr_bytes"] = len(text)
+        return len(text)
+
     def run_once(self, trigger="schedule"):
         if not self.lock.acquire(blocking=False):
             return False, "a scrape is already running"
         try:
             with self.state_lock:
                 self.state.update({"status": "running", "last_started_at": utc_now(), "last_error": None})
-            result = subprocess.run(
-                self.command(), cwd=ROOT, capture_output=True, text=True, timeout=self.timeout,
-                env=os.environ.copy(),
-            )
+            try:
+                result = run_with_wall_clock_deadline(
+                    self.command(), self.timeout, env=os.environ.copy(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                # 子进程已被 kill，把它死前吐出来的 stderr 整段留档再往上收口。
+                # 这份文件只装**抓取轮次**的 stderr —— 放在这里就是为了不被后面
+                # 推送/日报的超时顶掉（那两处的 stderr 短，/status 的尾部够用）。
+                self.keep_full_stderr(
+                    getattr(exc, "stderr", None), getattr(exc, "output", "") or "")
+                raise
+            # 成功/非零退出两条路都先整段留档，再决定怎么收口。
+            self.keep_full_stderr(result.stderr)
             if result.returncode != 0:
                 error = (result.stderr or result.stdout or "unknown scraper error")[-4000:]
                 with self.state_lock:
@@ -242,14 +360,11 @@ class ScrapeService:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 atomic_write_json(PENDING_FEISHU_FILE, to_push)
                 PUSH_RESULT_FILE.unlink(missing_ok=True)
-                push = subprocess.run(
+                push = run_with_wall_clock_deadline(
                     [sys.executable, str(ROOT / "push_to_feishu.py"),
                      "--result-file", str(PUSH_RESULT_FILE)],
-                    cwd=ROOT,
-                    input=json.dumps(to_push, ensure_ascii=False),
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
+                    self.timeout,
+                    input_text=json.dumps(to_push, ensure_ascii=False),
                     env=os.environ.copy(),
                 )
                 if push.returncode != 0:
@@ -287,11 +402,14 @@ class ScrapeService:
             if self.should_report_today():
                 self.run_daily_report()
             return True, f"scrape completed: {len(rows)} new topics"
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # 墙钟到点：子进程已被 kill，这里按超时收口（不再有「跨过 N×容差还活着」）。
             error = f"scrape timed out after {self.timeout}s"
+            print(f"[{utc_now()}] {error}（子进程已 kill）", file=sys.stderr, flush=True)
             with self.state_lock:
                 self.state.update({
                     "status": "error", "last_finished_at": utc_now(), "last_error": error,
+                    "last_stderr": tail(getattr(exc, "stderr", None)) or self.state["last_stderr"],
                     "runs": self.state["runs"] + 1,
                 })
             return False, error
@@ -339,9 +457,8 @@ class ScrapeService:
     def run_daily_report(self):
         """生成日报；失败只记现场，不影响抓取主流程，更不允许打死调度线程。"""
         try:
-            result = subprocess.run(self.daily_report_command(), cwd=ROOT,
-                                    capture_output=True, text=True, timeout=self.timeout,
-                                    env=os.environ.copy())
+            result = run_with_wall_clock_deadline(
+                self.daily_report_command(), self.timeout, env=os.environ.copy())
             if result.returncode != 0:
                 self._record_report_error(f"日报生成失败: {tail(result.stderr or result.stdout, 500)}")
                 return False
@@ -407,19 +524,40 @@ class ScrapeService:
                 })
             return False, message
 
+    def announce_next_run(self):
+        """next_run_at = **本轮起点** + interval，返回那个墙钟时刻。
+
+        以前 due 在循环顶（上一轮收口之后）算，于是「一轮跑了 5h32m」会把下一轮整体
+        推到 11h32m 之后 —— 轮次越慢，节奏越散。现在锚定轮次起点：一轮跑了多久都只
+        从起点顺延。起点已经过去整个 interval（上一轮跑满）时立即接一轮，不空转：
+        下一轮跑完会重新锚定。
+        """
+        anchor = self.round_started or datetime.now(timezone.utc)
+        due = anchor + timedelta(seconds=self.interval)
+        now = datetime.now(timezone.utc)
+        if due <= now:
+            due = now
+        with self.state_lock:
+            self.state["next_run_at"] = due.isoformat(timespec="seconds")
+        return due
+
+    def run_round(self, trigger):
+        """跑一轮：起点先定下 next_run_at，整轮期间 /status 里的值都是准的。"""
+        self.round_started = datetime.now(timezone.utc)
+        self.announce_next_run()
+        return self.safe_run_once(trigger)
+
     def scheduler(self):
         if self.should_run_on_start():
-            self.safe_run_once("startup")
+            self.run_round("startup")
         else:
+            self.round_started = datetime.now(timezone.utc)
             with self.state_lock:
                 self.state["status"] = "idle"
         while True:
-            due = datetime.now(timezone.utc) + timedelta(seconds=self.interval)
-            with self.state_lock:
-                self.state["next_run_at"] = due.isoformat(timespec="seconds")
-            if not self.wait_until(due):
+            if not self.wait_until(self.announce_next_run()):
                 break
-            self.safe_run_once("schedule")
+            self.run_round("schedule")
         with self.state_lock:
             self.state["next_run_at"] = None
 
