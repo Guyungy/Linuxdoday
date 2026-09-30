@@ -128,9 +128,16 @@ def check_login(page):
     return _check_login(page)
 
 
-def wait_cf_challenge(page, url, timeout=60):
+def wait_cf_challenge(page, url, timeout=60, interval=2):
+    """转发 browser_utils.wait_cf_challenge。
+
+    返回的是 CfChallengeOutcome（不是 bool）：status ∈
+    passed / nav_failed / challenge / unconfirmed —— 「未确认」必须能与
+    「已确认通过但确实 0 行」分开记录，压回一个 bool 就又变成静默 0 条了。
+    两处签名（browser_utils.py / 这里）必须同步。
+    """
     from browser_utils import wait_cf_challenge as _wait_cf_challenge
-    return _wait_cf_challenge(page, url, timeout=timeout)
+    return _wait_cf_challenge(page, url, timeout=timeout, interval=interval)
 
 
 def _plain_text(html):
@@ -300,12 +307,19 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
                 page_num -= 1
                 continue
             log(f"  板块[{cat['n']}] JSON 失败({data.get('error') if data else '空'})，回退 DOM 解析")
-            dom_rows = scrape_category_dom(pg, cat, limit=limit, page_delay=page_delay)
+            dom_rows, cf = scrape_category_dom(pg, cat, limit=limit, page_delay=page_delay)
             if not dom_rows:
-                # JSON 和 DOM 都没拿到 —— 这正是「0 条被判成功」的源头（CF 挑战未过 /
-                # 登录态失效时，DOM 拿到的是挑战页，解析出 0 行且不报错）。
-                # 单个板块坏掉时整轮仍可能「成功」，所以这里必须留痕。
-                warn(f"板块[{cat['n']}] JSON 与 DOM 均未取到数据（疑似 CF 挑战未过 / 登录态失效）")
+                # JSON 和 DOM 都没拿到。**两种 0 条必须分开记**，否则排障时分不清
+                # 「根本没进去（判据未确认）」和「进去了但确实没抓到（选择器失效 /
+                # 页面真的为空）」—— 后者是可以继续查的现场，前者是通道问题。
+                # 单个板块坏掉时整轮仍可能「成功」，所以两者都必须经 WARN: 留痕，
+                # 由 service.extract_warnings 送进 /status 的 last_error。
+                if cf.passed:
+                    warn(f"板块[{cat['n']}] CF 挑战判据已确认通过，但 JSON 与 DOM 均 0 行"
+                         f"（页面确实无线程行 / 列表选择器失效）；落点: {cf.describe()}")
+                else:
+                    warn(f"板块[{cat['n']}] JSON 与 DOM 均未取到数据，且 CF 挑战判据未确认通过"
+                         f"（疑似挑战未过 / 登录态失效 / 导航失败）；落点: {cf.describe()}")
             return dom_rows
 
         topic_list = (data.get("topic_list") or {}).get("topics") or []
@@ -375,10 +389,17 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
 
 
 def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
-    """回退：DOM 解析版（从列表行直接抓）"""
+    """回退：DOM 解析版（从列表行直接抓）。
+
+    返回 (topics, cf)：cf 是 wait_cf_challenge 的结论对象。caller 据此把
+    「判据未确认通过」与「已确认通过但确实 0 行」分开记录 —— 旧版这里只有一个
+    bool，`if not ...: return []` 把四种「说不清」压成同一个空结果，上层无从分辨。
+    """
     url = BASE + cat["u"]
-    if not wait_cf_challenge(pg, url):
-        return []
+    cf = wait_cf_challenge(pg, url)
+    if not cf.passed:
+        warn(f"板块[{cat['n']}] DOM 回退未开始（判据未确认通过）；落点: {cf.describe()}")
+        return [], cf
 
     topics = []
     seen = set()
@@ -489,7 +510,7 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
         except Exception:
             break
 
-    return topics
+    return topics, cf
 
 
 def scrape_all(pg, cats, limit=0, max_pages=40):
