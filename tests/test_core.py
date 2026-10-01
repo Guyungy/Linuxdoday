@@ -783,5 +783,89 @@ class CiCoverageTests(unittest.TestCase):
                 self.assertTrue(py_compile.compile(str(REPO_ROOT / name), doraise=True))
 
 
+class DateTimeGateTests(unittest.TestCase):
+    """2026-10-01 事故回归：DOM 回退把标签文本写进时间字段 → 飞书 800010403，
+    且 record-batch-create 整批原子 → 937 条一条没进去。"""
+
+    # 事故里的原值：'link-bottom-line' 在列表页装的是标签，被当成创建时间。
+    TAG_TEXT = "纯水,人工智能,ChatGPT,OpenAI"
+    CN_LABEL = "创建日期：2026 年 9月 29 日"
+
+    def test_gate_rejects_non_time_text(self):
+        for junk in (self.TAG_TEXT, "软件开发", "快问快答", "此话题已对您置顶", ""):
+            with self.subTest(junk=junk):
+                self.assertEqual(feishu.normalize_datetime(junk), "")
+
+    def test_gate_accepts_real_forms(self):
+        cases = {
+            "2026-09-29 12:34:56": "2026-09-29 12:34:56",
+            "2026-09-29T12:34:56.000+08:00": "2026-09-29 12:34:56",
+            "2026-09-29": "2026-09-29 00:00:00",
+            self.CN_LABEL: "2026-09-29 00:00:00",
+            "1790833592414": "2026-10-01 05:46:32",  # 毫秒戳（Discourse data-time）
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(feishu.normalize_datetime(raw), want)
+
+    def test_both_modules_share_the_same_gate(self):
+        """抓取侧和推送侧口径必须一致，否则只改一处会留下反例。"""
+        samples = [self.TAG_TEXT, self.CN_LABEL, "2026-09-29T12:34:56Z", "", None,
+                   "1790833592414", "快问快答"]
+        for raw in samples:
+            with self.subTest(raw=raw):
+                self.assertEqual(scraper.normalize_datetime(raw), feishu.normalize_datetime(raw))
+
+    def test_sanitize_fixes_already_formatted_rows(self):
+        """pending_feishu.json 这类已格式化行不走 feishu_rows()，闸门必须覆盖到。"""
+        rows = [
+            {"标题": "a", "Topic ID": "1", "发布时间": self.TAG_TEXT, "最近活跃": self.CN_LABEL},
+            {"标题": "b", "Topic ID": "2", "发布时间": "2026-09-29 12:34:56", "最近活跃": "2026-09-29 12:34:56"},
+        ]
+        fixed, patched = feishu.sanitize_rows(rows)
+        self.assertEqual(patched, 2)                       # 脏字符串 + 中文日期标签各算一次
+        self.assertEqual(fixed[0]["发布时间"], "")          # 非时间文本 → 留空，不再写脏值
+        self.assertEqual(fixed[0]["最近活跃"], "2026-09-29 00:00:00")
+        self.assertEqual(fixed[1]["发布时间"], "2026-09-29 12:34:56")  # 合法值原样保留
+        # 原行不被就地改写
+        self.assertEqual(rows[0]["发布时间"], self.TAG_TEXT)
+
+    def test_empty_datetime_is_dropped_not_sent_as_blank(self):
+        """飞书 datetime 字段收到空串同样 400，只有「键不存在」才等于留空。"""
+        payload = feishu.payload_records([
+            {"标题": "a", "Topic ID": "1", "发布时间": "", "最近活跃": "2026-09-29 12:34:56"},
+        ])
+        self.assertNotIn("发布时间", payload[0])
+        self.assertIn("最近活跃", payload[0])
+
+    def test_one_poison_row_does_not_kill_the_batch(self):
+        """整批被拒时二分重试：坏行隔离，其余照写（旧行为是 break，全批丢光）。"""
+        poison = "POISON"
+        rows = [{"标题": f"t{i}", "Topic ID": str(i)} for i in range(5)]
+        rows[2]["Topic ID"] = poison
+        calls = []
+
+        def fake_create(base_token, table, chunk, dry_run=False):
+            calls.append(len(chunk))
+            if any(r["Topic ID"] == poison for r in chunk):
+                return 0, "800010403 invalid_request"
+            return len(chunk), None
+
+        with patch.object(feishu, "create_records", side_effect=fake_create):
+            written, rejects = feishu.push("base", "table", rows)
+
+        self.assertEqual(written, 4)
+        self.assertEqual([r["Topic ID"] for r in rejects], [poison])
+        self.assertGreater(len(calls), 1)   # 确实拆过批
+
+    def test_dom_path_no_longer_falls_back_to_raw_text(self):
+        """抓取侧不许再把整段文本当时间回退（.link-bottom-line 里装的是标签）。"""
+        source = (REPO_ROOT / "linux_do_scraper.py").read_text(encoding="utf-8")
+        self.assertIn("data-time", source)                  # 毫秒时间戳来源
+        self.assertIn("创建日期", source)                    # td.activity[title] 里的中文标签
+        self.assertNotIn("b2.textContent.trim().substring(0, 60)", source)
+        self.assertNotIn("actTd.textContent.trim()", source)
+
+
 if __name__ == "__main__":
     unittest.main()

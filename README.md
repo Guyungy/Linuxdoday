@@ -285,6 +285,18 @@ browser 模式抓取时会顺带更新热榜（复用同一个浏览器会话，
 
 > 自动写入飞书需要运行环境已安装并配置 `lark-cli`。默认 Docker 镜像只负责抓取和 HTTP API，不内置个人飞书凭据。
 
+### 写飞书的两道护栏（别删）
+
+1. **时间字段出站前统一过闸**：`normalize_datetime()`（scraper 与 push 各一份、口径必须一致）。
+   飞书 `datetime` 字段只吃 RFC3339 或 `YYYY-MM-DD HH:MM:SS`，喂别的直接 `800010403`；
+   认不出来的值一律置空，并在拼 payload 时**整键剔除**（空串同样报 400，只有缺键才等于留空）。
+2. **整批被拒就二分重试**：`record-batch-create` 是整批原子的，一条脏值会让同批 200 条一起 400。
+   `push_chunk()` 会把失败批劈到单条，坏行写进 `data/rejected_topics.json` 隔离，好行照写。
+   一条都没进去（令牌失效／网络／表结构变更）才保留 `pending_feishu.json` 等下轮重试。
+
+   > 起因：2026-10-01 12:16 DOM 回退路径把 `.link-bottom-line` 里的**标签文本**
+   > （`"纯水,人工智能,ChatGPT"`）当成创建时间写进了时间字段，937 条整轮 400，一条没进去。
+
 Docker Compose 使用命名卷 `linuxdoday-data` 保存数据，更新或重建容器不会丢失。
 
 ## systemd 部署

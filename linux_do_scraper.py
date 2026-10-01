@@ -33,7 +33,7 @@ import re
 import sys
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from xml.etree import ElementTree
@@ -43,6 +43,45 @@ from xml.etree import ElementTree
 # ---------------------------------------------------------------------------
 BASE = "https://linux.do"
 PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
+
+# 飞书 datetime 字段只吃 RFC3339 或 "YYYY-MM-DD HH:MM:SS"，喂别的直接 800010403
+# invalid_request；而 record-batch-create 是整批原子的 —— 一条脏值废掉整批 200 条
+# （2026-10-01 那次 937 条全灭就是被 29 条脏时间拖的）。
+# 所以所有时间出站前统一过这道闸，认不出来就返回空串（飞书侧即留空）。
+# 见 push_to_feishu.py 的同名函数，两处口径必须一致。
+_DT_ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
+_DT_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DT_CN_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\D*(\d{1,2})?\s*[:：]?\s*(\d{1,2})?")
+
+
+def normalize_datetime(value):
+    """把抓来的时间值收敛成飞书 datetime 字段能接受的字符串；认不出来返回 ""。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.match(r"^\d{10,13}$", text):
+        try:
+            stamp = int(text)
+            if stamp > 10 ** 12:
+                stamp //= 1000
+            return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            return ""
+    m = _DT_ISO_RE.match(text)
+    if m:
+        year, month, day, hour, minute, second = m.groups()
+        return f"{year}-{month}-{day} {hour}:{minute}:{second or '00'}"
+    m = _DT_DATE_RE.match(text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} 00:00:00"
+    m = _DT_CN_RE.search(text)
+    if m:
+        year, month, day = m.group(1), int(m.group(2)), int(m.group(3))
+        hour, minute = int(m.group(4) or 0), int(m.group(5) or 0)
+        return f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
+    return ""
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
 BROWSER_DATA = os.path.join(os.getcwd(), "browser_data")
@@ -430,27 +469,36 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
                     const anyCard = row.querySelector('[data-user-card]');
                     if (anyCard) author = anyCard.getAttribute('data-user-card') || '';
                 }
-                // 时间: 最后活跃 a.last-posted-at 或 td.activity a，优先绝对时间 title
-                let bumped_at = '';
-                const lastPosted = row.querySelector('a.last-posted-at, td.activity a, td.num.activity a, td.activity');
-                if (lastPosted) {
-                    bumped_at = lastPosted.getAttribute('title') || lastPosted.getAttribute('datetime') || '';
+                // 时间口径（DOM 回退路径）。Discourse 列表行里时间只有两个可信来源：
+                //   1) td.activity 里 span.relative-date[data-time]（毫秒时间戳）→ 最后活跃
+                //   2) td.activity[title] 形如「创建日期：2026 年 10月 1 日 13:44 / 最新：… 13:46」→ 两个时间都在这
+                // 注意：.link-bottom-line 在列表页装的是**标签**（"快问快答,ChatGPT"）。
+                // 旧实现拿它当创建时间回退、拿 td.activity.textContent 当最后活跃回退，
+                // 脏文本进飞书 datetime 字段 → 800010403 invalid_request；而
+                // record-batch-create 是整批原子的 → **一条脏值废掉整批 200 条**
+                // （2026-10-01 12:16 那次 937 条全灭）。解析不出来就留空。
+                // 输出统一按 UTC+8 墙钟（飞书表时区固定 Asia/Shanghai），
+                // 这样容器 TZ=UTC 时也不会整体偏 8 小时。
+                const shPad = (n) => String(n == null ? 0 : n).padStart(2, '0');
+                const cnTime = (ms) => {
+                    if (!ms) return '';
+                    const d = new Date(Number(ms) + 8 * 3600 * 1000);
+                    return d.getUTCFullYear() + '-' + shPad(d.getUTCMonth() + 1) + '-' + shPad(d.getUTCDate())
+                        + ' ' + shPad(d.getUTCHours()) + ':' + shPad(d.getUTCMinutes()) + ':' + shPad(d.getUTCSeconds());
+                };
+                const activityTd = row.querySelector('td.activity, td.num.activity');
+                const activityTitle = (activityTd && activityTd.getAttribute('title')) || '';
+                // 用正则字面量（不要用 RegExp(字符串)：JS 字符串里反斜杠转义会被吃掉）
+                const cnTimeMap = {};
+                const cnRe = /(创建日期|最新)[：:]\\s*(\\d{4})\\s*年\\s*(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日[^\\d]*(\\d{1,2})?[:：]?\\s*(\\d{1,2})?/g;
+                let cnMatch;
+                while ((cnMatch = cnRe.exec(activityTitle)) !== null) {
+                    cnTimeMap[cnMatch[1]] = cnMatch[2] + '-' + shPad(cnMatch[3]) + '-' + shPad(cnMatch[4])
+                        + ' ' + shPad(cnMatch[5]) + ':' + shPad(cnMatch[6]) + ':00';
                 }
-                if (!bumped_at) {
-                    const actTd = row.querySelector('td.activity, td.num.activity');
-                    if (actTd) bumped_at = actTd.getAttribute('title') || actTd.textContent.trim() || '';
-                }
-                // 创建时间: .link-bottom-line 内 span[title]（如 "创建日期：2026 年 9月 16 日"）或相对时间
-                let created_at = '';
-                const bottomLine = row.querySelector('.link-bottom-line');
-                if (bottomLine) {
-                    const t = bottomLine.querySelector('span[title]');
-                    if (t) created_at = t.getAttribute('title') || t.textContent.trim();
-                }
-                if (!created_at) {
-                    const b2 = row.querySelector('.link-bottom-line');
-                    if (b2) created_at = b2.textContent.trim().substring(0, 60);
-                }
+                const stampEl = row.querySelector('span.relative-date[data-time], [data-time]');
+                const bumped_at = (stampEl ? cnTime(stampEl.getAttribute('data-time')) : '') || cnTimeMap['最新'] || '';
+                const created_at = cnTimeMap['创建日期'] || '';
 
                 out.push({
                     id: id,
@@ -634,21 +682,6 @@ def feishu_rows(rows):
     """把 topic 列表转成飞书多维表格字段格式的 JSON 行"""
     out = []
     for r in rows:
-        created = r.get("created_at") or ""
-        bumped = r.get("bumped_at") or ""
-        # 时间戳转 ISO（Discourse 是 RFC3339；秒级时间戳则换算）
-        def fmt(ts):
-            if not ts:
-                return ""
-            try:
-                if re.match(r"^\d{10,13}$", str(ts)):
-                    ts = int(ts)
-                    if ts > 1e12:
-                        ts /= 1000
-                    return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-                return ts.replace("T", " ").replace("Z", "")[:19]
-            except Exception:
-                return str(ts)
         out.append({
             "标题": r.get("title", ""),
             "帖子链接": BASE + r.get("url", ""),
@@ -656,8 +689,9 @@ def feishu_rows(rows):
             "板块": r.get("category", ""),
             "回复数": int(r.get("replies", 0) or 0),
             "浏览量": int(r.get("views", 0) or 0),
-            "发布时间": fmt(created),
-            "最近活跃": fmt(bumped),
+            # 时间统一走闸门（老实现是 ts[:19] 硬截断，标签文本也能被截成"时间"）
+            "发布时间": normalize_datetime(r.get("created_at")),
+            "最近活跃": normalize_datetime(r.get("bumped_at")),
             "Topic ID": r.get("id", ""),
             "标签": r.get("tags") or [],
             "正文": r.get("content", ""),
