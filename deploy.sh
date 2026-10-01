@@ -14,9 +14,7 @@ echo "== backup =="
 ls -la "$BK"
 echo "== discard local mods (content already committed in 6118cf4) =="
 git checkout -- .
-echo "== drop untracked colliders (backed up) =="
-rm -f daily_report.py hot_topics.py
-rm -rf reports
+
 echo "== fast-forward main -> delivered revision =="
 # --- 落地目标：按 commit 钉死（POLL-77）---
 # 原写法是分支名 agent/builder-a4/poll-69：live 目录里的 *本地* 同名分支指向 b45156a
