@@ -1,5 +1,6 @@
 import ast
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -1108,6 +1109,23 @@ class DeploymentDefaultsTests(unittest.TestCase):
         # 端口只发布到宿主机回环，不对整个局域网开放。
         self.assertIn('"127.0.0.1:8080:8080"', compose)
 
+    def test_compose_requires_a_service_token(self):
+        """AC5.3：compose 的 SERVICE_TOKEN 不能默认空。
+
+        默认空 + 默认开鉴权 = 照抄 compose 起容器后 /status /topics /hot 一律 401，
+        而「读鉴权开着」这个信号本身就在 /status 里 —— 连它都看不到，/health 却全绿。
+        """
+        compose = (REPO_ROOT / "docker-compose.service.yml").read_text(encoding="utf-8")
+        self.assertRegex(compose, r"SERVICE_TOKEN:\s*\"\$\{SERVICE_TOKEN:\?")
+        self.assertNotIn("${SERVICE_TOKEN:-}", compose)
+
+        # 文档得跟上：compose 快速开始里必须写明这个变量是必填的。
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        start = readme.index("## 快速部署：Docker Compose")
+        quick_start = readme[start:start + 1200]
+        self.assertIn("SERVICE_TOKEN", quick_start)
+        self.assertIn("必填", quick_start)
+
     def test_readme_documents_the_shipped_defaults(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertRegex(readme, r"\|\s*`SERVICE_HOST`\s*\|\s*`127\.0\.0\.1`\s*\|")
@@ -1295,6 +1313,420 @@ class DateTimeGateTests(unittest.TestCase):
         self.assertIn("创建日期", source)                    # td.activity[title] 里的中文标签
         self.assertNotIn("b2.textContent.trim().substring(0, 60)", source)
         self.assertNotIn("actTd.textContent.trim()", source)
+
+
+class HealthProbeTests(unittest.TestCase):
+    """AC2.3：/health 必须反映「调度线程已死」。
+
+    P2 的故障形态就是「服务自称健康、实际已停止抓取」：HTTP 线程照常服务、
+    /health 全绿。所以这里用真 HTTP + 真调度线程，把两个方向都钉住。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.patches = []
+        with patch.dict(os.environ, {"SCRAPE_MODE": "rss", "RUN_ON_START": "false"}):
+            self.svc = service.ScrapeService()
+        self.patches.append(patch.object(service, "LATEST_FILE", root / "latest_run.json"))
+        self.patches.append(patch.object(service, "HOT_FILE", root / "hot_topics.json"))
+        self.patches.append(patch.object(service, "SERVICE", self.svc))
+        self.patches.append(patch.object(service.Handler, "log_message", lambda *args: None))
+        for item in self.patches:
+            item.start()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        for item in reversed(self.patches):
+            item.stop()
+        self.tmp.cleanup()
+
+    def health(self):
+        with urllib.request.urlopen(self.base + "/health", timeout=5) as response:
+            self.assertEqual(200, response.status)      # 探针形状不变：仍是 200
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_health_is_not_ok_when_the_scheduler_never_started(self):
+        """验收方实测的那个形态：完全不启动调度线程，/health 却全绿。"""
+        body = self.health()
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["scheduler_alive"])
+        self.assertIsNone(body["last_tick_at"])
+
+    def test_health_tracks_the_scheduler_thread_both_ways(self):
+        worker = threading.Thread(target=self.svc.scheduler, daemon=True)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not self.svc.snapshot()["scheduler_alive"]:
+                time.sleep(0.01)
+
+            alive = self.health()
+            self.assertTrue(alive["ok"])
+            self.assertTrue(alive["scheduler_alive"])
+            self.assertIsNotNone(alive["last_tick_at"])
+
+            self.svc.stop_event.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+
+            dead = self.health()
+            self.assertFalse(dead["ok"])                 # 线程停了 → 不再 ok
+            self.assertFalse(dead["scheduler_alive"])
+        finally:
+            self.svc.stop_event.set()
+            worker.join(5)
+
+    def test_scheduler_liveness_flag_survives_an_escaping_exception(self):
+        """异常从调度线程逃逸（finally 分支）也必须把存活标志落回 False。"""
+        svc = self.svc
+        with patch.object(svc, "should_run_on_start", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                svc.scheduler()
+        snapshot = svc.snapshot()
+        self.assertFalse(snapshot["scheduler_alive"])
+        self.assertIsNone(snapshot["next_run_at"])
+
+
+class ReadAuthWithoutTokenTests(unittest.TestCase):
+    """AC5.2：开了读鉴权却没给令牌 —— 行为必须显式且安全，且不能只在启动日志里。"""
+
+    @staticmethod
+    def status_of(url, method="GET"):
+        request = urllib.request.Request(url, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_protect_reads_with_an_empty_token_rejects_everything_and_warns(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        with patch.dict(os.environ, {"SCRAPE_MODE": "rss", "SERVICE_TOKEN": "",
+                                     "PROTECT_READ_ENDPOINTS": "true"}):
+            svc = service.ScrapeService()
+        with svc.state_lock:
+            svc.state["status"] = "idle"
+        for item in (patch.object(service, "LATEST_FILE", root / "latest_run.json"),
+                     patch.object(service, "HOT_FILE", root / "hot_topics.json"),
+                     patch.object(service, "SERVICE", svc),
+                     patch.object(service.Handler, "log_message", lambda *args: None)):
+            item.start()
+            self.addCleanup(item.stop)
+
+        # 1) 非静默：启动警告必须点名「令牌为空 → 读接口一律 401」
+        warnings = service.startup_warnings()
+        self.assertTrue(any("SERVICE_TOKEN" in message and "401" in message
+                            for message in warnings), warnings)
+
+        # 2) 安全：所有读接口都拒绝，手动触发也被禁用，只有探针活着
+        server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        for path in ("/status", "/topics", "/hot"):
+            with self.subTest(path=path):
+                self.assertEqual(401, self.status_of(base + path))
+        self.assertEqual(403, self.status_of(base + "/run", method="POST"))   # 空令牌禁用 /run
+        self.assertEqual(200, self.status_of(base + "/health"))               # 探针不受影响
+        self.assertEqual(200, self.status_of(base + "/ready"))
+
+
+class ServiceZeroRowGuardTests(unittest.TestCase):
+    """P1 服务层兜底：0 条这件事，service 自己也要能判。
+
+    只在 scraper 里改等于把结论托付给子进程的自觉 —— 而 `last_success_at`
+    是 service 刷的。
+    """
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    @staticmethod
+    def scraper_output(rows):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+
+    def test_browser_zero_rows_without_cats_is_a_service_side_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            latest = root / "latest_run.json"
+            good = {"generated_at": "2026-01-01T00:00:00+00:00", "count": 7,
+                    "topics": [{"Topic ID": "7"}]}
+            latest.write_text(json.dumps(good), encoding="utf-8")
+
+            # 先挂 LATEST_FILE 再构造 service：_seed_state_from_history 会读它。
+            with patch.object(service, "LATEST_FILE", latest):
+                svc = self.build(SCRAPE_MODE="browser")
+                before = svc.snapshot()["last_success_at"]
+            with patch.object(service, "LATEST_FILE", latest), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service.subprocess, "run",
+                              return_value=self.scraper_output([])):
+                ok, _ = svc.run_once("test")
+            snapshot = svc.snapshot()
+            kept = json.loads(latest.read_text(encoding="utf-8"))
+
+        self.assertIsNotNone(before)                              # 前提：之前确实成功过
+        self.assertFalse(ok)
+        self.assertEqual("error", snapshot["status"])
+        self.assertEqual(before, snapshot["last_success_at"])     # 没有被刷新
+        self.assertEqual(1, snapshot["consecutive_failures"])
+        self.assertIn("0 条", snapshot["last_error"])
+        self.assertEqual(good, kept)                              # 上一份好数据不被覆盖
+
+    def test_zero_rows_with_explicit_cats_is_tolerated(self):
+        """反向断言：判据不能一刀切 —— 指定了板块时 0 条可能是正常结果。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            svc = self.build(SCRAPE_MODE="browser", SCRAPE_CATEGORIES="开发调优")
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service.subprocess, "run",
+                              return_value=self.scraper_output([])):
+                ok, _ = svc.run_once("test")
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)
+        self.assertEqual("idle", snapshot["status"])
+        self.assertIsNotNone(snapshot["last_success_at"])
+
+    def test_rss_zero_rows_is_left_to_the_scraper_side_gate(self):
+        """rss 的 0 条由抓取器自己的 assert_rows_present 兜（非零退出）。
+
+        service 侧这道门按口径只在 browser + 未指定 `--cats` 时生效，
+        两边不重复也不留缝。
+        """
+        rss = self.build(SCRAPE_MODE="rss")
+        browser = self.build(SCRAPE_MODE="browser")
+        self.assertFalse(rss.zero_rows_is_failure(0))
+        self.assertFalse(browser.zero_rows_is_failure(1))
+        self.assertTrue(browser.zero_rows_is_failure(0))
+        with self.assertRaises(RuntimeError):
+            scraper.assert_rows_present([], "rss")
+
+
+class FailureAccountingTests(unittest.TestCase):
+    """P1：连续失败要计数、重复的同一错误要去重。
+
+    口径纳入这条的理由：别让「每 6 小时一条 error」变成新的背景噪音。
+    """
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    @staticmethod
+    def failure(message="❌ 抓取结果为 0 条\n"):
+        return SimpleNamespace(returncode=1, stdout="", stderr=message)
+
+    def test_repeated_identical_failures_are_counted_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            svc = self.build(SCRAPE_MODE="rss")
+            stderr = io.StringIO()
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service.subprocess, "run", return_value=self.failure()), \
+                 contextlib.redirect_stderr(stderr):
+                for _ in range(service.FAILURE_REANNOUNCE_EVERY):
+                    ok, _ = svc.run_once("test")
+            snapshot = svc.snapshot()
+            announced = stderr.getvalue().count("抓取失败")
+
+        self.assertFalse(ok)
+        self.assertEqual(service.FAILURE_REANNOUNCE_EVERY, snapshot["runs"])
+        self.assertEqual(service.FAILURE_REANNOUNCE_EVERY, snapshot["consecutive_failures"])
+        self.assertEqual(service.FAILURE_REANNOUNCE_EVERY, snapshot["last_error_repeat"])
+        self.assertIn("0 条", snapshot["last_error"])
+        # 第 1 轮播一次 + 第 FAILURE_REANNOUNCE_EVERY 轮重播一次，中间不刷屏
+        self.assertEqual(2, announced)
+
+    def test_a_different_error_restarts_the_repeat_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            svc = self.build(SCRAPE_MODE="rss")
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service.subprocess, "run", return_value=self.failure()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                svc.run_once("test")
+                svc.run_once("test")
+                with patch.object(service.subprocess, "run",
+                                  return_value=self.failure("❌ 网络不通\n")):
+                    svc.run_once("test")
+            snapshot = svc.snapshot()
+
+        self.assertEqual(3, snapshot["consecutive_failures"])     # 连续失败不清零
+        self.assertEqual(1, snapshot["last_error_repeat"])        # 换了错误就是新的一条
+        self.assertIn("网络不通", snapshot["last_error"])
+
+    def test_success_resets_the_failure_streak(self):
+        """成功一轮 = 上一段故障结束：连续计数、去重签名、last_error 一起清零。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            svc = self.build(SCRAPE_MODE="rss")
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with patch.object(service.subprocess, "run", return_value=self.failure()):
+                    svc.run_once("test")
+                    svc.run_once("test")
+                with patch.object(service.subprocess, "run",
+                                  return_value=SimpleNamespace(
+                                      returncode=0, stdout=json.dumps([{"Topic ID": "1"}]),
+                                      stderr="")):
+                    ok, _ = svc.run_once("test")
+                after_success = svc.snapshot()
+
+                # 再来同一条错误：这是**新的一段**故障，不能被算成上一段的第 3 次重复
+                with patch.object(service.subprocess, "run", return_value=self.failure()):
+                    svc.run_once("test")
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)
+        self.assertEqual(0, after_success["consecutive_failures"])
+        self.assertEqual(0, after_success["last_error_repeat"])
+        self.assertIsNone(after_success["last_error"])
+        self.assertEqual(1, snapshot["consecutive_failures"])
+        self.assertEqual(1, snapshot["last_error_repeat"])
+
+
+class DocsCrossLinkTests(unittest.TestCase):
+    """AC4.1：两份 README 互链，且链接目标真实存在（不能只靠人眼）。"""
+
+    @staticmethod
+    def links(path):
+        return re.findall(r"\[[^\]]*\]\(([^)]+)\)", path.read_text(encoding="utf-8"))
+
+    def test_readmes_cross_link_each_other(self):
+        root_readme = REPO_ROOT / "README.md"
+        docker_readme = REPO_ROOT / "docker" / "README.md"
+
+        self.assertIn("docker/README.md", self.links(root_readme))
+        self.assertIn("../README.md", self.links(docker_readme))
+
+        # 链接目标按各自文件所在目录解析后必须真的存在
+        self.assertTrue((REPO_ROOT / "docker/README.md").is_file())
+        self.assertTrue((docker_readme.parent / "../README.md").resolve().is_file())
+
+
+class ReadmeImageClaimTests(unittest.TestCase):
+    """AC3.3：镜像相关段落必须同时写出「未验证」标注与「本机源码运行」指路。
+
+    口径改判后不再要求「写死 rss」；要防的是把「依赖与文件齐了」推成「能跑」。
+    """
+
+    HEADING = "### 服务镜像的能力边界"
+    LAYERS = (
+        "已断言的事实",
+        "未验证",
+        "唯一已验证能跑 browser 模式的路径是本机源码运行",
+    )
+
+    def readme(self):
+        return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    def image_section(self):
+        readme = self.readme()
+        self.assertIn(self.HEADING, readme, "README 缺少〈服务镜像的能力边界〉小节")
+        rest = readme.split(self.HEADING, 1)[1]
+        end = re.search(r"\n#{1,3} ", rest)
+        return rest[: end.start()] if end else rest
+
+    def test_image_section_states_the_three_layers(self):
+        section = self.image_section()
+        for marker in self.LAYERS:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, section)
+        # 「未验证」必须点名未验证的是什么，不能只写一句「可能有风险」
+        for fact in ("从未真实构建", "Cloudflare", "不等价"):
+            with self.subTest(fact=fact):
+                self.assertIn(fact, section)
+
+    def test_the_old_overclaim_is_gone(self):
+        """反向断言：改判前那句「镜像可跑 browser 模式」不得再出现。"""
+        readme = self.readme()
+        self.assertNotIn("可跑 browser 模式", readme)
+        # 而且镜像段落里「本机源码运行」是作为**唯一已验证**路径出现的
+        self.assertIn("唯一已验证能跑 browser 模式的路径是本机源码运行", self.image_section())
+
+
+class ImportSmokeTests(unittest.TestCase):
+    """AC6.2：import 冒烟，分档写。
+
+    CI 只装 `requirements-service.txt`，所以只能这样分：
+      真 import：`hot_topics.py`；
+      依赖门禁：`linux_do_headless.py` / `browser_utils.py` / `linux_do_auto_browse.py` /
+                `linux_do_gui.py` —— 缺 DrissionPage / playwright 时按口径「只能停在
+                py_compile」，本档断言的是**失败原因必须是缺依赖**，而不是语法错/名字错。
+    冒烟放在子进程里跑：模块级的 sys.exit 会直接把测试进程带走，不能在本进程 import。
+
+    ⚠️ 与口径的差异：口径把 `linux_do_headless.py` 列进「可安全 import」，实测不成立 ——
+    它在模块级 try/except 里自检 DrissionPage，缺失时 print + `sys.exit(1)`。
+    所以本档按「可预期」而不是「必定成功」来断言。
+    """
+
+    SAFE_TO_IMPORT = ["hot_topics.py"]
+    # 模块 -> 允许的「缺依赖」名单。linux_do_gui.py 先 import tkinter（解释器可能根本
+    # 没编 Tk），过了这关才轮到 DrissionPage —— 缺哪个都算依赖缺失，都不算写坏。
+    DEPENDENCY_GUARDED = {
+        "linux_do_headless.py": ("DrissionPage",),
+        "browser_utils.py": ("playwright",),
+        "linux_do_auto_browse.py": ("DrissionPage",),
+        "linux_do_gui.py": ("tkinter", "DrissionPage"),
+    }
+    COMPILE_ONLY = ["browser_utils.py", "linux_do_auto_browse.py", "linux_do_gui.py"]
+    NOT_A_DEPENDENCY_ERROR = ("SyntaxError", "IndentationError", "NameError", "AttributeError")
+
+    def test_safe_modules_import_in_process(self):
+        for name in self.SAFE_TO_IMPORT:
+            with self.subTest(module=name):
+                module = importlib.import_module(Path(name).stem)
+                self.assertTrue(callable(module.collect))
+
+    def test_dependency_guarded_modules_import_or_name_the_missing_package(self):
+        for name, dependencies in self.DEPENDENCY_GUARDED.items():
+            with self.subTest(module=name):
+                proc = subprocess.run([sys.executable, "-c", f"import {Path(name).stem}"],
+                                      cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60)
+                output = proc.stdout + proc.stderr
+                if proc.returncode == 0:
+                    continue                       # 依赖装齐了：直接 import 成功，最高档
+                self.assertTrue(any(dependency in output for dependency in dependencies),
+                                f"{name} import 失败，原因不是缺 {' / '.join(dependencies)}"
+                                f"（可能真的写坏了）: {output}")
+                for noise in self.NOT_A_DEPENDENCY_ERROR:
+                    self.assertNotIn(noise, output)
+
+    def test_ci_runs_the_dependency_free_smoke(self):
+        """CI 里必须真跑一次 import 冒烟，不能只写在测试里没人执行。"""
+        workflow = (REPO_ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+        self.assertIn("import hot_topics", workflow)
+
+    def test_tiers_are_disjoint_and_compile_only_is_covered(self):
+        safe = set(self.SAFE_TO_IMPORT)
+        guarded = set(self.DEPENDENCY_GUARDED)
+        compile_only = set(self.COMPILE_ONLY)
+        self.assertEqual(set(), safe & (guarded | compile_only))
+        self.assertEqual(compile_only, guarded - {"linux_do_headless.py"})
+        self.assertNotEqual(set(), compile_only)
+        # 「只到 py_compile」那一档必须真的被 py_compile 覆盖（CiCoverageTests 跑全仓）
+        if not (REPO_ROOT / ".git").exists():
+            self.skipTest("非 git 检出（tarball）环境，跳过清单核对")
+        tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "*.py"],
+                                 capture_output=True, text=True, check=True).stdout.split()
+        for name in compile_only:
+            with self.subTest(module=name):
+                self.assertIn(name, tracked)
 
 
 if __name__ == "__main__":
