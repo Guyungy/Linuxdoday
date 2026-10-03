@@ -1,503 +1,201 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Export a Linux.do topic for offline reading (read-only).
+
+This replaces the retired random-scroll / random-like bot. It fetches the
+topic's Discourse JSON through the project's persistent Chrome profile and
+writes a Markdown copy. It does not click like/reply/bookmark controls or
+automatically visit a list of topics.
+
+Examples:
+    .venv/bin/python linux_do_auto_browse.py --topic https://linux.do/t/topic/2975832
+    .venv/bin/python linux_do_auto_browse.py --topic 2975832 --limit 20
+
+The browser profile is ``browser_data/`` (separate from the user's main Chrome).
+Use ``--show-browser`` to make it visible for a one-time manual login.
 """
-linux.do 论坛自动浏览脚本 v2.0
-功能：自动登录、浏览帖子、滚动阅读、随机点赞
 
-使用方法：
-1. 确保Chrome浏览器已安装
-2. 配置代理地址（如需要）
-3. 首次运行时手动登录，后续会保持登录状态
-4. 运行脚本：python linux_do_auto_browse.py
+from __future__ import annotations
 
-依赖：pip install DrissionPage
-"""
-
-import sys
-import io
-import os
-import random
-import time
+import argparse
+import html
 import json
+import re
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
-
-# 设置UTF-8输出
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
-from DrissionPage import ChromiumPage, ChromiumOptions
-
-# ==================== 配置区域 ====================
-
-class Config:
-    """配置类"""
-    # 代理设置（如不需要代理，设为None）
-    PROXY = "127.0.0.1:7897"
-
-    # 目标URL
-    BASE_URL = "https://linux.do"
-    CATEGORY_URL = "https://linux.do/c/develop/develop-lv2/31"
-
-    # 浏览设置
-    MIN_TOPICS_PER_SESSION = 5      # 每次会话最少浏览帖子数
-    MAX_TOPICS_PER_SESSION = 15     # 每次会话最多浏览帖子数
-    LIKE_PROBABILITY = 0.3          # 点赞概率 (0-1)
-    LIKE_REPLY_PROBABILITY = 0.2    # 点赞回复的概率 (0-1)
-
-    # 时间设置（秒）
-    PAGE_LOAD_WAIT = 3              # 页面加载等待时间
-    SCROLL_INTERVAL = (1, 3)        # 滚动间隔范围
-    READ_TIME = (5, 15)             # 阅读帖子时间范围
-    BETWEEN_TOPICS = (3, 8)         # 帖子之间的等待时间范围
-
-    # 无头模式（True=后台运行，False=显示浏览器）
-    HEADLESS = False
-
-    # 日志文件
-    LOG_FILE = "linux_do_browse.log"
-
-
-# ==================== 日志工具 ====================
-
-def log(message, level="INFO"):
-    """记录日志"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_line = f"[{timestamp}] [{level}] {message}"
-    print(log_line)
-
-    # 写入日志文件
-    try:
-        with open(Config.LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(log_line + '\n')
-    except:
-        pass
-
-
-# ==================== 浏览器管理 ====================
-
-class BrowserManager:
-    """浏览器管理类"""
-
-    def __init__(self):
-        self.page = None
-
-    def init_browser(self):
-        """初始化浏览器"""
-        log("正在初始化浏览器...")
-
-        co = ChromiumOptions()
-
-        # 设置代理
-        if Config.PROXY:
-            co.set_proxy(Config.PROXY)
-            log(f"已设置代理: {Config.PROXY}")
-
-        # 反检测设置
-        co.set_argument('--disable-blink-features=AutomationControlled')
-
-        # 无头模式
-        if Config.HEADLESS:
-            co.headless(True)
-            log("已启用无头模式")
-
-        # 创建浏览器实例
-        self.page = ChromiumPage(co)
-        log("浏览器初始化完成")
-
-        return self.page
-
-    def close(self):
-        """关闭浏览器"""
-        if self.page:
-            try:
-                self.page.quit()
-                log("浏览器已关闭")
-            except:
-                pass
-
-
-# ==================== 论坛操作类 ====================
-
-class LinuxDoBot:
-    """linux.do 论坛自动化操作类"""
-
-    def __init__(self, page):
-        self.page = page
-        self.visited_topics = set()  # 已访问的帖子
-        self.liked_posts = set()     # 已点赞的帖子
-        self.stats = {
-            "topics_viewed": 0,
-            "posts_liked": 0,
-            "scroll_count": 0,
-            "errors": 0
-        }
-
-    def check_login_status(self):
-        """检查登录状态"""
-        log("检查登录状态...")
-
-        # 访问首页
-        self.page.get(Config.BASE_URL)
-        time.sleep(Config.PAGE_LOAD_WAIT)
-
-        # 检测登录元素
-        current_user = self.page.ele('#current-user', timeout=3)
-        if current_user:
-            # 尝试获取用户名
-            try:
-                username_img = self.page.ele('.current-user img', timeout=2)
-                username = username_img.attr('title') if username_img else "未知用户"
-            except:
-                username = "已登录用户"
-
-            log(f"登录状态: 已登录 ({username})")
-            return True
-        else:
-            log("登录状态: 未登录", "WARNING")
-            return False
-
-    def manual_login(self):
-        """引导用户手动登录"""
-        log("请在浏览器中手动登录...")
-        log("登录完成后，按回车键继续...")
-
-        # 访问登录页面
-        self.page.get(Config.BASE_URL)
-        time.sleep(2)
-
-        # 点击登录按钮
-        login_btn = self.page.ele('.login-button', timeout=3)
-        if login_btn:
-            login_btn.click()
-            log("已点击登录按钮，请在浏览器中完成登录")
-
-        # 等待用户输入
-        input("按回车键继续...")
-
-        # 再次检查登录状态
-        return self.check_login_status()
-
-    def get_topic_list(self):
-        """获取帖子列表"""
-        log(f"正在获取帖子列表: {Config.CATEGORY_URL}")
-
-        self.page.get(Config.CATEGORY_URL)
-        time.sleep(Config.PAGE_LOAD_WAIT)
-
-        # 获取帖子链接
-        topics = []
-
-        # 使用JS获取帖子信息
-        topic_data = self.page.run_js("""
-        function getTopics() {
-            const links = document.querySelectorAll('.topic-list a.title');
-            const topics = [];
-            links.forEach(a => {
-                const href = a.href;
-                const title = a.textContent.trim();
-                // 过滤掉分类链接，只保留帖子链接
-                if (href && href.includes('/t/topic/') && title) {
-                    topics.push({
-                        url: href,
-                        title: title.substring(0, 50)
-                    });
-                }
-            });
-            return topics;
-        }
-        return getTopics();
-        """)
-
-        if topic_data:
-            topics = topic_data
-            log(f"找到 {len(topics)} 个帖子")
-
-        return topics
-
-    def scroll_page(self, duration=None):
-        """模拟滚动页面阅读"""
-        if duration is None:
-            duration = random.uniform(*Config.READ_TIME)
-
-        log(f"开始滚动阅读，预计 {duration:.1f} 秒")
-
-        start_time = time.time()
-        scroll_count = 0
-
-        while time.time() - start_time < duration:
-            # 随机滚动距离
-            scroll_distance = random.randint(200, 500)
-
-            # 执行滚动
-            self.page.run_js(f"window.scrollBy(0, {scroll_distance})")
-            scroll_count += 1
-
-            # 随机等待
-            time.sleep(random.uniform(*Config.SCROLL_INTERVAL))
-
-            # 检查是否到底部
-            at_bottom = self.page.run_js("""
-            return (window.innerHeight + window.scrollY) >= document.body.offsetHeight - 100;
-            """)
-
-            if at_bottom:
-                log("已滚动到页面底部")
-                break
-
-        self.stats["scroll_count"] += scroll_count
-        log(f"滚动完成，共滚动 {scroll_count} 次")
-
-    def find_like_buttons(self):
-        """查找所有点赞按钮"""
-        # 使用JS查找点赞按钮，更可靠
-        buttons_info = self.page.run_js("""
-        function findLikeButtons() {
-            // 多种选择器尝试
-            const selectors = [
-                'button.btn-toggle-reaction-like',
-                '.discourse-reactions-reaction-button button',
-                'button[title="点赞此帖子"]',
-                '.post-menu-area button.reaction-button'
-            ];
-
-            let buttons = [];
-            for (const sel of selectors) {
-                const found = document.querySelectorAll(sel);
-                if (found.length > 0) {
-                    found.forEach((btn, idx) => {
-                        // 检查是否已点赞
-                        const hasLiked = btn.classList.contains('has-like') ||
-                                        btn.classList.contains('my-likes') ||
-                                        btn.closest('.discourse-reactions-reaction-button')?.classList.contains('has-used');
-
-                        buttons.push({
-                            index: idx,
-                            selector: sel,
-                            hasLiked: hasLiked,
-                            title: btn.title || '',
-                            visible: btn.offsetParent !== null
-                        });
-                    });
-                    break;  // 找到就停止
-                }
-            }
-            return buttons;
-        }
-        return findLikeButtons();
-        """)
-
-        return buttons_info or []
-
-    def like_post(self, button_index=0):
-        """点赞帖子"""
-        try:
-            # 先获取按钮信息
-            buttons_info = self.find_like_buttons()
-
-            if not buttons_info:
-                log("未找到点赞按钮", "DEBUG")
-                return False
-
-            if button_index >= len(buttons_info):
-                log(f"按钮索引 {button_index} 超出范围", "DEBUG")
-                return False
-
-            btn_info = buttons_info[button_index]
-
-            # 检查是否已点赞
-            if btn_info.get('hasLiked'):
-                log(f"帖子 #{button_index + 1} 已点赞，跳过")
-                return False
-
-            # 使用JS点击按钮
-            clicked = self.page.run_js(f"""
-            function clickLikeButton(index) {{
-                const selectors = [
-                    'button.btn-toggle-reaction-like',
-                    '.discourse-reactions-reaction-button button',
-                    'button[title="点赞此帖子"]',
-                    '.post-menu-area button.reaction-button'
-                ];
-
-                for (const sel of selectors) {{
-                    const buttons = document.querySelectorAll(sel);
-                    if (buttons.length > index) {{
-                        const btn = buttons[index];
-                        // 滚动到按钮位置
-                        btn.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                        // 等待一下再点击
-                        setTimeout(() => btn.click(), 300);
-                        return true;
-                    }}
-                }}
-                return false;
-            }}
-            return clickLikeButton({button_index});
-            """)
-
-            if clicked:
-                time.sleep(1)  # 等待点赞动画
-                self.stats["posts_liked"] += 1
-                log(f"成功点赞帖子 #{button_index + 1}")
-                return True
-            else:
-                log(f"点击点赞按钮失败", "DEBUG")
-                return False
-
-        except Exception as e:
-            log(f"点赞失败: {e}", "ERROR")
-            self.stats["errors"] += 1
-            return False
-
-    def browse_topic(self, topic_url, topic_title):
-        """浏览单个帖子"""
-        log(f"正在浏览: {topic_title}")
-
-        try:
-            # 访问帖子
-            self.page.get(topic_url)
-            time.sleep(Config.PAGE_LOAD_WAIT)
-
-            # 标记为已访问
-            self.visited_topics.add(topic_url)
-            self.stats["topics_viewed"] += 1
-
-            # 滚动阅读
-            self.scroll_page()
-
-            # 等待页面稳定
-            time.sleep(1)
-
-            # 获取点赞按钮信息
-            buttons_info = self.find_like_buttons()
-            log(f"找到 {len(buttons_info)} 个点赞按钮")
-
-            if buttons_info:
-                # 随机决定是否点赞主帖
-                if random.random() < Config.LIKE_PROBABILITY:
-                    log("决定点赞主帖")
-                    self.like_post(0)
-                    time.sleep(random.uniform(0.5, 1.5))
-
-                # 随机决定是否点赞回复
-                if len(buttons_info) > 1:
-                    for i in range(1, len(buttons_info)):
-                        if random.random() < Config.LIKE_REPLY_PROBABILITY:
-                            log(f"决定点赞回复 #{i}")
-                            self.like_post(i)
-                            time.sleep(random.uniform(0.5, 1.5))
-
-            log(f"完成浏览: {topic_title}")
-            return True
-
-        except Exception as e:
-            log(f"浏览帖子失败: {e}", "ERROR")
-            self.stats["errors"] += 1
-            return False
-
-    def run_session(self):
-        """运行一次浏览会话"""
-        log("=" * 50)
-        log("开始新的浏览会话")
-        log("=" * 50)
-
-        # 检查登录状态
-        if not self.check_login_status():
-            if not self.manual_login():
-                log("登录失败，退出", "ERROR")
-                return False
-
-        # 获取帖子列表
-        topics = self.get_topic_list()
+from urllib.parse import urlparse
+
+BASE_URL = "https://linux.do"
+EXPORT_DIR = Path(__file__).resolve().parent / "exports"
+
+
+def topic_ref_from(value: str) -> tuple[str, str]:
+    """Accept either a Linux.do topic URL or a numeric topic id."""
+    value = value.strip()
+    if value.isdigit():
+        return "topic", value
+    parsed = urlparse(value)
+    match = re.search(r"/t/([^/]+)/(\d+)(?:/|$)", parsed.path)
+    if not match or parsed.hostname not in {"linux.do", "www.linux.do"}:
+        raise ValueError("--topic must be a topic ID or a linux.do topic URL")
+    return match.group(1), match.group(2)
+
+
+def plain_text(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
+    value = re.sub(r"</(?:p|div|li|blockquote|h[1-6])\s*>", "\n", value, flags=re.I)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+    return re.sub(r"[ \t]+", " ", value).strip()
+
+
+def markdown_for_topic(data: dict, limit: int = 0) -> str:
+    details = data.get("topic") or data
+    stream = data.get("post_stream") or {}
+    posts = stream.get("posts") or []
+    if limit:
+        posts = posts[:limit]
+    title = details.get("title") or "Linux.do topic"
+    lines = [f"# {title}", "", f"- Topic ID: {details.get('id', '')}",
+             f"- Category: {details.get('category_id', '')}",
+             f"- Exported: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+             f"- Posts exported: {len(posts)} / {details.get('posts_count', len(posts))}", ""]
+    for post in posts:
+        content = post.get("raw") or post.get("cooked") or ""
+        if "<" in content:
+            content = plain_text(content)
+        lines.extend([f"## Post #{post.get('post_number', '?')} · {post.get('username', 'unknown')}",
+                      "", content.strip(), ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def fetch_topic(page, slug: str, topic_id: str) -> dict:
+    """Fetch one topic JSON using the same-origin logged-in browser context."""
+    return page.evaluate("""async (args) => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30000);
+        const r = await fetch(`/t/${args.slug}/${args.id}.json`, {
+          credentials: 'include', headers: {Accept: 'application/json'}, signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (!r.ok) return {error: `HTTP ${r.status}`};
+        return await r.json();
+      } catch (e) { return {error: String(e)}; }
+    }""", {"slug": slug, "id": topic_id})
+
+
+def fetch_latest_refs(page, count: int) -> list[tuple[str, str]]:
+    """Read the live latest list, paging until count distinct topics are found."""
+    refs = []
+    seen = set()
+    for page_number in range((count // 20) + 10):
+        data = page.evaluate("""async (pageNumber) => {
+          const r = await fetch(`/latest.json?page=${pageNumber}`, {
+            credentials: 'include', headers: {Accept: 'application/json'}
+          });
+          if (!r.ok) return {error: `HTTP ${r.status}`};
+          return await r.json();
+        }""", page_number)
+        if data.get("error"):
+            raise RuntimeError(f"latest list page {page_number}: {data['error']}")
+        topics = (data.get("topic_list") or {}).get("topics") or []
         if not topics:
-            log("未找到帖子，退出", "ERROR")
-            return False
-
-        # 过滤已访问的帖子
-        new_topics = [t for t in topics if t['url'] not in self.visited_topics]
-        log(f"新帖子数量: {len(new_topics)}")
-
-        if not new_topics:
-            log("没有新帖子可浏览")
-            return True
-
-        # 随机选择要浏览的帖子数量
-        num_to_browse = random.randint(
-            Config.MIN_TOPICS_PER_SESSION,
-            min(Config.MAX_TOPICS_PER_SESSION, len(new_topics))
-        )
-        log(f"本次会话将浏览 {num_to_browse} 个帖子")
-
-        # 随机打乱顺序
-        random.shuffle(new_topics)
-
-        # 浏览帖子
-        for i, topic in enumerate(new_topics[:num_to_browse]):
-            log(f"\n--- 帖子 {i + 1}/{num_to_browse} ---")
-
-            self.browse_topic(topic['url'], topic['title'])
-
-            # 帖子之间等待
-            if i < num_to_browse - 1:
-                wait_time = random.uniform(*Config.BETWEEN_TOPICS)
-                log(f"等待 {wait_time:.1f} 秒后继续...")
-                time.sleep(wait_time)
-
-        # 输出统计
-        self.print_stats()
-
-        return True
-
-    def print_stats(self):
-        """输出统计信息"""
-        log("\n" + "=" * 50)
-        log("会话统计")
-        log("=" * 50)
-        log(f"浏览帖子数: {self.stats['topics_viewed']}")
-        log(f"点赞次数: {self.stats['posts_liked']}")
-        log(f"滚动次数: {self.stats['scroll_count']}")
-        log(f"错误次数: {self.stats['errors']}")
-        log("=" * 50)
+            break
+        for item in topics:
+            topic_id = str(item.get("id") or "")
+            if not topic_id or topic_id in seen:
+                continue
+            seen.add(topic_id)
+            refs.append((item.get("slug") or "topic", topic_id))
+            if len(refs) == count:
+                return refs
+        time.sleep(0.5)
+    raise RuntimeError(f"live latest list returned only {len(refs)} distinct topics; requested {count}")
 
 
-# ==================== 主程序 ====================
-
-def main():
-    """主函数"""
-    log("=" * 60)
-    log("linux.do 论坛自动浏览脚本启动")
-    log("=" * 60)
-
-    browser = BrowserManager()
-
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Export Linux.do topics as Markdown (read-only).")
+    parser.add_argument("--topic", action="append", default=[], help="Linux.do topic ID or URL; repeat for multiple topics")
+    parser.add_argument("--from-hot", type=int, default=0, metavar="N", help="also export N distinct topics from the cached daily hot list")
+    parser.add_argument("--from-cache", type=int, default=0, metavar="N", help="also export N recent distinct topics from data/linuxdo_topics.json")
+    parser.add_argument("--latest", type=int, default=0, metavar="N", help="export N topics from the live latest list")
+    parser.add_argument("--delay", type=float, default=1.0, help="seconds between topic requests (default: 1)")
+    parser.add_argument("--limit", type=int, default=0, help="maximum posts to export (0 = all returned by topic JSON)")
+    parser.add_argument("--output", type=Path, help="output Markdown path (default: exports/<topic-id>.md)")
+    parser.add_argument("--no-proxy", action="store_true", help="do not use LINUXDO_PROXY")
+    parser.add_argument("--show-browser", action="store_true", help="show the project's browser_data Chrome profile")
+    args = parser.parse_args(argv)
+    if args.limit < 0 or args.from_hot < 0 or args.from_cache < 0 or args.latest < 0 or args.delay < 0:
+        parser.error("numeric arguments must be zero or greater")
+    if args.output and (args.from_hot or args.from_cache or args.latest or len(args.topic) != 1):
+        parser.error("--output requires exactly one --topic")
+    refs = []
     try:
-        # 初始化浏览器
-        page = browser.init_browser()
+        refs = [topic_ref_from(value) for value in args.topic]
+        if args.from_hot:
+            hot_path = Path(__file__).resolve().parent / "data" / "hot_topics.json"
+            hot = json.loads(hot_path.read_text(encoding="utf-8"))
+            refs.extend(topic_ref_from(str(item["id"])) for item in hot.get("daily", [])[:args.from_hot])
+        if args.from_cache:
+            cache_path = Path(__file__).resolve().parent / "data" / "linuxdo_topics.json"
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            recent = sorted(cached, key=lambda item: item.get("created_at") or "", reverse=True)
+            for item in recent:
+                ref = topic_ref_from(str(item["id"]))
+                if ref not in refs:
+                    refs.append(ref)
+                if len(refs) >= len(args.topic) + args.from_hot + args.from_cache:
+                    break
+    except (ValueError, KeyError, OSError) as exc:
+        parser.error(f"invalid topic or hot list: {exc}")
+    refs = list(dict.fromkeys(refs))
+    if not refs and not args.latest:
+        parser.error("provide --topic or --from-hot")
 
-        # 创建机器人实例
-        bot = LinuxDoBot(page)
+    from browser_utils import PROXY_DEFAULT, start_browser
 
-        # 运行浏览会话
-        bot.run_session()
-
-        log("\n脚本执行完成")
-
-        # 保持浏览器打开一段时间（可选）
-        if not Config.HEADLESS:
-            log("浏览器将在30秒后关闭，或按Ctrl+C立即退出")
-            time.sleep(30)
-
-    except KeyboardInterrupt:
-        log("\n用户中断，正在退出...")
-
-    except Exception as e:
-        log(f"发生错误: {e}", "ERROR")
-        import traceback
-        traceback.print_exc()
-
+    context = None
+    try:
+        context, page = start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT,
+                                      headless=False, offscreen=not args.show_browser)
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
+        # Allow an already-authenticated profile / Cloudflare clearance to settle.
+        time.sleep(2)
+        if args.latest:
+            live_refs = fetch_latest_refs(page, args.latest)
+            refs = list(dict.fromkeys(refs + live_refs))
+            print(f"Fetched {len(live_refs)} distinct topics from live /latest.json", flush=True)
+        failed = 0
+        for index, (slug, topic_id) in enumerate(refs, 1):
+            if index > 1:
+                time.sleep(args.delay)
+            try:
+                for attempt in range(3):
+                    data = fetch_topic(page, slug, topic_id)
+                    if data and data.get("error") in {"HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504"} and attempt < 2:
+                        time.sleep(2 ** (attempt + 1))
+                        continue
+                    break
+                if not data or data.get("error"):
+                    raise RuntimeError((data or {}).get("error", "empty response"))
+                if not (data.get("post_stream") or {}).get("posts"):
+                    raise RuntimeError("topic response had no posts")
+                output = args.output or (EXPORT_DIR / f"{topic_id}.md")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(markdown_for_topic(data, args.limit), encoding="utf-8")
+                print(f"[{index}/{len(refs)}] Exported topic {topic_id}: {len(data['post_stream']['posts'][:args.limit or None])} posts -> {output}", flush=True)
+            except Exception as exc:
+                failed += 1
+                print(f"Could not fetch topic {topic_id}: {exc}", file=sys.stderr, flush=True)
+        print(f"Completed: {len(refs) - failed}/{len(refs)} topics", flush=True)
+        return 1 if failed else 0
     finally:
-        browser.close()
+        if context is not None:
+            context.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

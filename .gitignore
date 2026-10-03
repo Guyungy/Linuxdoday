@@ -64,3 +64,9 @@ LDStatusPro/
 
 # WorkBuddy workspace memory
 .workbuddy/
+
+# Agent scratch / 生成物（不入库）
+.tmp_work/
+exports/
+reports/AI日报-*.md
+reports/帖子清单-*.md

@@ -373,8 +373,20 @@ launchctl list | grep linuxdoday
 
 - RSS 通道每个板块通常返回最新约 25 条，包含标题、作者、发布时间和首帖正文，但没有浏览量、回复数等完整指标。
 - 服务镜像的 `browser` 目标会带上 `playwright` 与 Chrome，可跑 browser 模式；
-  `linux_do_gui.py` / `linux_do_headless.py` / `linux_do_auto_browse.py` 这几个
-  桌面/DrissionPage 脚本仍不随镜像发布。
+  `linux_do_gui.py` / `linux_do_headless.py` 等桌面脚本不随镜像发布。
+- `linux_do_auto_browse.py` 已改为只读话题导出器（不再模拟滚动或随机点赞），使用项目自己的
+  `browser_data/` Chrome 配置，不会接管主 Chrome：
+
+  ```bash
+  .venv/bin/python linux_do_auto_browse.py --topic https://linux.do/t/topic/2975832
+  .venv/bin/python linux_do_auto_browse.py --topic 2975832 --topic 2973276 --limit 5
+  .venv/bin/python linux_do_auto_browse.py --from-hot 3 --limit 5
+  .venv/bin/python linux_do_auto_browse.py --latest 200 --limit 5
+  ```
+
+  `--from-hot` 读取本地 `data/hot_topics.json` 的日榜缓存；多条主题在同一个浏览器会话中顺序导出。
+  `--latest` 实时分页读取 Linux.do 的最新主题列表，然后逐条导出；`--limit` 限制每条主题导出的帖子数。
+  Markdown 默认写入 `exports/<topic-id>.md`；如要手动登录项目配置，可加 `--show-browser`。
 - DrissionPage 路线（`linux_do_headless.py` 等）已弃用：4.x 与 Chrome 153 不兼容
   （WebSocket 404），`.github/workflows/run-schedule.yml` 保留但已标注为 legacy，
   且定时触发早已禁用。抓数据请用 `service.py`。

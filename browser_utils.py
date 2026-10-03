@@ -37,16 +37,24 @@ def kill_stale_chrome():
     导致 launch_persistent_context 无法复用登录态。只杀本项目自己的实例。"""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "browser_data"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-        if out:
-            for pid in out.splitlines():
+            ["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5,
+        ).stdout
+        pids = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid, command = parts
+            if ("Google Chrome.app/Contents/MacOS/Google Chrome" in command
+                    and f"--user-data-dir={USER_DATA_DIR}" in command):
+                pids.append(int(pid))
+        if pids:
+            for pid in pids:
                 try:
-                    os.kill(int(pid), 15)
-                except Exception:
+                    os.kill(pid, 15)
+                except ProcessLookupError:
                     pass
-            log(f"已清理残留 Chrome 进程: {out.replace(chr(10), ', ')}")
+            log(f"已清理项目 Chrome 进程: {', '.join(map(str, pids))}")
             time.sleep(2)
     except Exception:
         pass
@@ -113,6 +121,44 @@ def check_login(page, timeout=45):
         return page.locator("#current-user").count() > 0
     except Exception:
         return False
+
+
+_JS_SESSION = """
+async () => {
+    try {
+        const r = await fetch('/session/current.json',
+            {credentials: 'include', headers: {Accept: 'application/json'}});
+        if (!r.ok) return {status: r.status};
+        const j = await r.json();
+        return {status: 200, user: ((j.current_user || {}).username) || null};
+    } catch (e) { return {status: 'ERR ' + e}; }
+}
+"""
+
+
+def check_session(page, retries=3, interval=4, goto=True):
+    """用 /session/current.json 判登录态，返回 (ok, username)。
+
+    比 check_login 稳：不依赖 `#current-user` 是否渲染出来 —— CF 挑战页上 DOM 里
+    没有该元素，会给出「未登录」的假警报（实测同一会话一会儿 True 一会儿 False），
+    而 JSON 接口在 cf_clearance 有效时直接给 200 + current_user。
+    """
+    if goto and "linux.do" not in (page.url or ""):
+        try:
+            page.goto(BASE, timeout=45000, wait_until="domcontentloaded")
+            time.sleep(2)
+        except Exception:
+            pass
+    for i in range(max(1, retries)):
+        try:
+            r = page.evaluate(_JS_SESSION)
+        except Exception as exc:
+            r = {"status": f"EXC {type(exc).__name__}"}
+        if isinstance(r, dict) and r.get("status") == 200 and r.get("user"):
+            return True, r["user"]
+        if i < retries - 1:
+            time.sleep(interval)
+    return False, None
 
 
 def wait_cf_challenge(page, url, timeout=60):
