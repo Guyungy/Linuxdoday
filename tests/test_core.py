@@ -1469,7 +1469,7 @@ class ServiceZeroRowGuardTests(unittest.TestCase):
                 before = svc.snapshot()["last_success_at"]
             with patch.object(service, "LATEST_FILE", latest), \
                  patch.object(service, "DATA_DIR", root), \
-                 patch.object(service.subprocess, "run",
+                 patch.object(service, "run_with_wall_clock_deadline",
                               return_value=self.scraper_output([])):
                 ok, _ = svc.run_once("test")
             snapshot = svc.snapshot()
@@ -1490,7 +1490,7 @@ class ServiceZeroRowGuardTests(unittest.TestCase):
             svc = self.build(SCRAPE_MODE="browser", SCRAPE_CATEGORIES="开发调优")
             with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
                  patch.object(service, "DATA_DIR", root), \
-                 patch.object(service.subprocess, "run",
+                 patch.object(service, "run_with_wall_clock_deadline",
                               return_value=self.scraper_output([])):
                 ok, _ = svc.run_once("test")
             snapshot = svc.snapshot()
@@ -1535,7 +1535,8 @@ class FailureAccountingTests(unittest.TestCase):
             stderr = io.StringIO()
             with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
                  patch.object(service, "DATA_DIR", root), \
-                 patch.object(service.subprocess, "run", return_value=self.failure()), \
+                 patch.object(service, "run_with_wall_clock_deadline",
+                              return_value=self.failure()), \
                  contextlib.redirect_stderr(stderr):
                 for _ in range(service.FAILURE_REANNOUNCE_EVERY):
                     ok, _ = svc.run_once("test")
@@ -1556,11 +1557,12 @@ class FailureAccountingTests(unittest.TestCase):
             svc = self.build(SCRAPE_MODE="rss")
             with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
                  patch.object(service, "DATA_DIR", root), \
-                 patch.object(service.subprocess, "run", return_value=self.failure()), \
+                 patch.object(service, "run_with_wall_clock_deadline",
+                              return_value=self.failure()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 svc.run_once("test")
                 svc.run_once("test")
-                with patch.object(service.subprocess, "run",
+                with patch.object(service, "run_with_wall_clock_deadline",
                                   return_value=self.failure("❌ 网络不通\n")):
                     svc.run_once("test")
             snapshot = svc.snapshot()
@@ -1577,10 +1579,11 @@ class FailureAccountingTests(unittest.TestCase):
             with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
                  patch.object(service, "DATA_DIR", root), \
                  contextlib.redirect_stderr(io.StringIO()):
-                with patch.object(service.subprocess, "run", return_value=self.failure()):
+                with patch.object(service, "run_with_wall_clock_deadline",
+                                  return_value=self.failure()):
                     svc.run_once("test")
                     svc.run_once("test")
-                with patch.object(service.subprocess, "run",
+                with patch.object(service, "run_with_wall_clock_deadline",
                                   return_value=SimpleNamespace(
                                       returncode=0, stdout=json.dumps([{"Topic ID": "1"}]),
                                       stderr="")):
@@ -1588,7 +1591,8 @@ class FailureAccountingTests(unittest.TestCase):
                 after_success = svc.snapshot()
 
                 # 再来同一条错误：这是**新的一段**故障，不能被算成上一段的第 3 次重复
-                with patch.object(service.subprocess, "run", return_value=self.failure()):
+                with patch.object(service, "run_with_wall_clock_deadline",
+                                  return_value=self.failure()):
                     svc.run_once("test")
             snapshot = svc.snapshot()
 
