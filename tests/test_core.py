@@ -38,6 +38,24 @@ def fake_browser_utils():
     )
 
 
+def load_browser_utils():
+    """拿到**真实的** browser_utils（不是上面的假货）。
+
+    它在顶层就 `from playwright.sync_api import sync_playwright`，本机与 CI 都没装
+    playwright —— 缺依赖时塞一个桩模块进去把它导进来；模块里的 playwright 只在
+    start_browser 里用，判据函数用不到。
+    """
+    try:
+        import browser_utils
+        return browser_utils
+    except ImportError:
+        stub = SimpleNamespace(sync_playwright=lambda: None)
+        with patch.dict("sys.modules", {"playwright": SimpleNamespace(sync_api=stub),
+                                        "playwright.sync_api": stub}):
+            import browser_utils
+            return browser_utils
+
+
 class ScraperTests(unittest.TestCase):
     def test_browser_uses_full_category_path(self):
         class Page:
@@ -401,17 +419,24 @@ class ZeroRowDetectionTests(unittest.TestCase):
         self.assertEqual(1, caught.exception.code)
 
     def test_board_empty_via_json_and_dom_leaves_a_warning(self):
-        """P1 的源头：JSON 失败 + DOM 也没有数据时，必须留下 WARN 现场。"""
+        """P1 的源头：JSON 失败 + DOM 也没有数据时，必须留下 WARN 现场。
+
+        POLL-81：DOM 回退现在回 (rows, cf) —— 判据没确认通过时，现场里要带上
+        结论本身（status/detail），否则排障时看不出是「没进去」还是「进去过」。
+        """
+        bu = load_browser_utils()
         page = SimpleNamespace(evaluate=unittest.mock.Mock(side_effect=[{"error": "HTTP 403"}] * 2))
+        outcome = bu.CfChallengeOutcome(bu.CF_CHALLENGE, "仍在 Cloudflare 挑战页", "请稍候…")
         stderr = io.StringIO()
         with patch.object(scraper.time, "sleep"), \
-             patch.object(scraper, "scrape_category_dom", return_value=[]), \
+             patch.object(scraper, "scrape_category_dom", return_value=([], outcome)), \
              contextlib.redirect_stderr(stderr):
             rows = scraper.scrape_category(page, {"n": "开发调优", "u": "/c/develop/4"},
                                            page_delay=(0, 0))
         self.assertEqual([], rows)
         self.assertIn(scraper.WARN_PREFIX, stderr.getvalue())
         self.assertIn("CF 挑战", stderr.getvalue())
+        self.assertIn("challenge", stderr.getvalue())
 
     def test_rows_present_does_not_trip_the_guard(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -425,6 +450,197 @@ class ZeroRowDetectionTests(unittest.TestCase):
                     )
                 self.assertEqual(0, caught.exception.code)
                 self.assertTrue(cache.exists())
+
+
+class FakeChallengePage:
+    """只实现 wait_cf_challenge 用到的两个方法：goto / evaluate。"""
+
+    def __init__(self, goto_error=None, probe=None, probe_error=None):
+        self.goto_error = goto_error
+        self.probe = probe
+        self.probe_error = probe_error
+        self.goto_calls = []
+        self.probes = 0
+
+    def goto(self, url, timeout=None):
+        self.goto_calls.append((url, timeout))
+        if self.goto_error:
+            raise self.goto_error
+
+    def evaluate(self, script, arg=None):
+        self.probes += 1
+        if self.probe_error:
+            raise self.probe_error
+        return self.probe
+
+
+def ready_probe(title="开发调优 - LINUX DO", url="https://linux.do/c/develop/4",
+                challenge=False, ready=True):
+    return {"title": title, "url": url, "challenge": challenge, "ready": ready}
+
+
+class CfChallengeCriteriaTests(unittest.TestCase):
+    """POLL-81 AC1/AC2：判据必须把「导航失败 / 挑战未过 / 未确认」与「已确认通过」分开。
+
+    旧版只有「title 里没有 'Just a moment'」一条：goto 异常被 except 吞掉、title 为空、
+    中文挑战页 —— 一律返回 True（挑战已过），随后 DOM 查出 0 行且不报错。
+    """
+
+    def setUp(self):
+        self.bu = load_browser_utils()
+
+    def wait(self, page, timeout=0.05):
+        # timeout 给到极小：循环里「先探测一次、再看是否到点」，所以恰好探测一次。
+        with patch.object(self.bu.time, "sleep"):
+            return self.bu.wait_cf_challenge(page, "https://linux.do/c/develop/4", timeout=timeout)
+
+    # —— AC1：四种「说不清」都不得被当成「挑战已过」 ——
+
+    def test_navigation_failure_is_not_reported_as_passed(self):
+        page = FakeChallengePage(goto_error=TimeoutError("Timeout 60000ms exceeded"))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_NAV_FAILED, out.status)
+        self.assertFalse(out.passed)
+        self.assertFalse(bool(out))
+        self.assertIn("TimeoutError", out.detail)
+        # 导航没成功就不拿「旧页的 title」去猜 —— 一次探测都不做。
+        self.assertEqual(0, page.probes)
+
+    def test_empty_title_is_not_reported_as_passed(self):
+        page = FakeChallengePage(probe=ready_probe(title="", ready=True))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_UNCONFIRMED, out.status)
+        self.assertFalse(out.passed)
+        self.assertIn("title 为空", out.detail)
+
+    def test_chinese_challenge_page_is_not_reported_as_passed(self):
+        # CF 把「Just a moment…」本地化成「请稍候…」，旧判据只认英文串 → 直接判通过。
+        page = FakeChallengePage(probe=ready_probe(title="请稍候…", challenge=True, ready=False))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_CHALLENGE, out.status)
+        self.assertFalse(out.passed)
+        self.assertEqual("请稍候…", out.title)
+
+    def test_chinese_title_alone_is_enough(self):
+        # 挑战页 DOM 标记没抓到、只有中文 title，同样不能算通过。
+        page = FakeChallengePage(probe=ready_probe(title="请稍候…", challenge=False, ready=False))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_CHALLENGE, out.status)
+        self.assertFalse(out.passed)
+
+    def test_english_challenge_titles_still_recognised(self):
+        for title in ("Just a moment...", "Attention Required! | Cloudflare", "Checking your browser before accessing"):
+            with self.subTest(title=title):
+                page = FakeChallengePage(probe=ready_probe(title=title, ready=False))
+                out = self.wait(page)
+                self.assertEqual(self.bu.CF_CHALLENGE, out.status)
+
+    def test_non_target_page_is_not_reported_as_passed(self):
+        """没有挑战特征、title 也非空，但**不是**目标站点的页面 —— 只能算未确认。"""
+        page = FakeChallengePage(probe=ready_probe(title="502 Bad Gateway", ready=False))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_UNCONFIRMED, out.status)
+        self.assertFalse(out.passed)
+        self.assertIn("不是目标站点页面", out.detail)
+
+    def test_probe_failure_is_not_reported_as_passed(self):
+        page = FakeChallengePage(probe_error=RuntimeError("Execution context was destroyed"))
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_UNCONFIRMED, out.status)
+        self.assertFalse(out.passed)
+
+    # —— AC2：真通过时不得被误判 ——
+
+    def test_confirmed_pass_is_reported_as_passed(self):
+        page = FakeChallengePage(probe=ready_probe())
+        out = self.wait(page)
+        self.assertEqual(self.bu.CF_PASSED, out.status)
+        self.assertTrue(out.passed)
+        self.assertTrue(bool(out))
+        self.assertEqual(1, page.probes)          # 一次探测即确认，不空等
+        self.assertEqual("https://linux.do/c/develop/4", page.goto_calls[0][0])
+
+    def test_passed_needs_the_target_page_not_just_a_non_challenge_title(self):
+        """AC1 的核心裂缝：title 里没有挑战串 ≠ 通过。必须有正向证据。"""
+        page = FakeChallengePage(probe=ready_probe(title="随便一个页面", ready=False))
+        self.assertFalse(self.wait(page).passed)
+        page = FakeChallengePage(probe=ready_probe(title="随便一个页面", ready=True))
+        self.assertTrue(self.wait(page).passed)
+
+    def test_non_passed_outcomes_are_all_falsy(self):
+        """漏改的 `if not wait_cf_challenge(...)` 必须失败在安全一侧。"""
+        for status in (self.bu.CF_NAV_FAILED, self.bu.CF_CHALLENGE, self.bu.CF_UNCONFIRMED):
+            with self.subTest(status=status):
+                self.assertFalse(bool(self.bu.CfChallengeOutcome(status, "x")))
+        self.assertTrue(bool(self.bu.CfChallengeOutcome(self.bu.CF_PASSED, "已确认通过")))
+
+    def test_describe_carries_the_evidence(self):
+        out = self.bu.CfChallengeOutcome(self.bu.CF_CHALLENGE, "仍在 Cloudflare 挑战页",
+                                         "请稍候…", "https://linux.do/c/develop/4")
+        text = out.describe()
+        self.assertIn("challenge", text)
+        self.assertIn("请稍候", text)
+        self.assertIn("https://linux.do/c/develop/4", text)
+
+
+class CfChallengeCallSiteTests(unittest.TestCase):
+    """POLL-81：判据收紧只是一半 —— 调用点不接线，0 条照旧静默。"""
+
+    def setUp(self):
+        self.bu = load_browser_utils()
+
+    def outcome(self, status, detail="x"):
+        return self.bu.CfChallengeOutcome(status, detail)
+
+    def test_dom_fallback_reports_outcome_and_warns_when_not_confirmed(self):
+        stderr = io.StringIO()
+        with patch.object(scraper, "wait_cf_challenge",
+                          return_value=self.outcome(self.bu.CF_NAV_FAILED, "TimeoutError: x")), \
+             contextlib.redirect_stderr(stderr):
+            rows, cf = scraper.scrape_category_dom(SimpleNamespace(),
+                                                   {"n": "开发调优", "u": "/c/develop/4"})
+        self.assertEqual([], rows)
+        self.assertFalse(cf.passed)
+        self.assertIn(scraper.WARN_PREFIX, stderr.getvalue())
+        self.assertIn("nav_failed", stderr.getvalue())
+
+    def scrape_with_dom(self, status, detail="x"):
+        """JSON 连续失败 → 回退 DOM（DOM 结论由 status 指定）→ 返回 (rows, stderr)。"""
+        page = SimpleNamespace(evaluate=unittest.mock.Mock(side_effect=[{"error": "HTTP 403"}] * 2))
+        stderr = io.StringIO()
+        with patch.object(scraper.time, "sleep"), \
+             patch.object(scraper, "scrape_category_dom",
+                          return_value=([], self.outcome(status, detail))), \
+             contextlib.redirect_stderr(stderr):
+            rows = scraper.scrape_category(page, {"n": "国产替代", "u": "/c/domestic/98"},
+                                           page_delay=(0, 0))
+        return rows, stderr.getvalue()
+
+    def test_confirmed_pass_with_zero_rows_is_recorded_as_such(self):
+        rows, text = self.scrape_with_dom(self.bu.CF_PASSED, "已确认通过")
+        self.assertEqual([], rows)
+        self.assertIn("已确认通过", text)
+        self.assertNotIn("未确认通过", text)
+
+    def test_unconfirmed_zero_rows_is_recorded_as_such(self):
+        rows, text = self.scrape_with_dom(self.bu.CF_CHALLENGE, "仍在 Cloudflare 挑战页")
+        self.assertEqual([], rows)
+        self.assertIn("未确认通过", text)
+        self.assertNotIn("已确认通过", text)
+
+    def test_board_failure_reaches_the_last_error_channel(self):
+        """板块级失败必须经 WARN: 前缀进 service 的 last_error（与 P1 同源通道）。"""
+        page = SimpleNamespace(evaluate=unittest.mock.Mock(side_effect=[{"error": "HTTP 403"}] * 2))
+        stderr = io.StringIO()
+        with patch.object(scraper.time, "sleep"), \
+             patch.object(scraper, "wait_cf_challenge",
+                          return_value=self.outcome(self.bu.CF_CHALLENGE, "仍在 Cloudflare 挑战页")), \
+             contextlib.redirect_stderr(stderr):
+            scraper.scrape_category(page, {"n": "国产替代", "u": "/c/domestic/98"}, page_delay=(0, 0))
+
+        warnings = service.extract_warnings(stderr.getvalue())
+        self.assertTrue(any("国产替代" in w and "未确认通过" in w for w in warnings), warnings)
+        self.assertNotIn("WARN:", "；".join(warnings))     # 前缀已在 service 侧剥离
 
 
 class WarningSurfacingTests(unittest.TestCase):
@@ -604,8 +820,18 @@ class WallClockDeadlineTests(unittest.TestCase):
         # 改 time.monotonic 打不到它，必须改这个绑定。
         return patch.object(service.subprocess, "_time", lambda: 0.0)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Windows 的 Popen._communicate 走 WaitForMultipleObjects(remaining_ms) 计时，"
+        "根本不读 subprocess._time —— patch 单调钟打不到它，这个对照实验在 Windows 上不成立。"
+        "CI 跑 ubuntu-latest，这里跳过不影响那两条真正验证 run_with_wall_clock_deadline 的用例。",
+    )
     def test_frozen_monotonic_defeats_plain_run_timeout(self):
-        """改前的跑法：单调钟冻住时 0.5s 的上限形同虚设。"""
+        """改前的跑法：单调钟冻住时 0.5s 的上限形同虚设。
+
+        这是个**对照实验**，测的是 CPython 标准库旧行为，不是本仓库的产品逻辑，
+        所以平台差异不算产品缺陷。仅在 POSIX 上成立。
+        """
         child = [sys.executable, "-c", "import time; time.sleep(2)"]
         started = time.time()
         with self.freeze_monotonic():

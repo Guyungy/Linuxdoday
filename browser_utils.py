@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 from playwright.sync_api import sync_playwright
 
@@ -139,6 +140,72 @@ async () => {
 """
 
 
+# ---------------------------------------------------------------------------
+# Cloudflare 挑战判据
+#
+# 判据必须**说得清**：旧版只有「title 里没有 'Just a moment' / 'Attention Required'」
+# 一条，于是下面四种情况一律返回 True（判定挑战已过），随后 DOM 查出 0 行却不报错：
+#   1) page.goto 抛异常，页面其实停在旧页（异常被 except 吞掉）；
+#   2) title 读不到（空串）；
+#   3) 中文挑战页（'请稍候…'）；
+#   4) 确实到了别的页面（CF 拦截页 / 错误页）。
+# 现在改成「必须拿到正向证据才算通过」，并且把「未确认」如实报出来。
+# ---------------------------------------------------------------------------
+
+CF_PASSED = "passed"            # 已确认：挑战已过，且页面确实是目标站点页面
+CF_NAV_FAILED = "nav_failed"    # 导航本身失败（goto 抛异常），目标页连样子都没见到
+CF_CHALLENGE = "challenge"      # 确认仍在挑战页（中英 title 特征或挑战页 DOM 标记）
+CF_UNCONFIRMED = "unconfirmed"  # 到点也没能确认：title 读不到 / 停在非目标页面
+
+# title 特征（中英双语）。原判据只认前两个英文串 —— 中文挑战页（CF 会把
+# 「Just a moment…」本地化成「请稍候…」）因此被判成「已通过」。
+CF_CHALLENGE_TITLE_HINTS = (
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "verify you are human",
+    "请稍候",
+    "正在检查您的浏览器",
+    "人机验证",
+)
+
+# 挑战页 DOM 标记：加载中的挑战页 title 可能是空的，只靠 title 看不出。
+CF_CHALLENGE_DOM_SELECTOR = ", ".join((
+    "#challenge-running",
+    "#challenge-stage",
+    "#challenge-form",
+    "#cf-challenge-running",
+    "#cf-please-wait",
+    "#turnstile-wrapper",
+    "div.cf-turnstile",
+    'iframe[src*="challenges.cloudflare.com"]',
+))
+
+# 目标站点的正向标记（Discourse 标准布局 / generator meta）。
+# 「真的到了 Linux.do」只能由正向标记确认 —— 没有它就只能算未确认。
+PAGE_READY_DOM_SELECTOR = ", ".join((
+    "#main-outlet",
+    ".topic-list",
+    "#d-header",
+    ".d-header",
+    'meta[name="generator"][content*="Discourse"]',
+))
+
+# 一次探测同时取回 title / 挑战标记 / 目标页标记：省往返，且三者取自同一时刻。
+_PROBE_JS = """
+(args) => {
+    const {challengeSel, readySel} = args;
+    const has = (sel) => { try { return !!document.querySelector(sel); } catch (e) { return false; } };
+    return {
+        title: document.title || "",
+        url: location.href,
+        challenge: has(challengeSel),
+        ready: has(readySel),
+    };
+}
+"""
+
+
 def check_session(page, retries=3, interval=4, goto=True):
     """用 /session/current.json 判登录态，返回 (ok, username)。
 
@@ -164,10 +231,71 @@ def check_session(page, retries=3, interval=4, goto=True):
     return False, None
 
 
-def wait_cf_challenge(page, url, timeout=60):
-    """等待 Cloudflare 挑战完成（title 不再含 'Just a moment'）。
+class CfChallengeOutcome(NamedTuple):
+    """wait_cf_challenge 的结论。
 
-    计时一律走墙钟（time.time），并且 deadline 锚在 goto **之前**：goto 的超时是
+    **bool(结论) 只在「已确认通过」时为 True** —— 任何「未确认」状态都是假值，
+    于是漏改的 `if not wait_cf_challenge(...)` 仍然失败在安全的一侧（不会被当成成功）。
+    调用方要区分细节时读 status / detail，不要再把它压回一个 bool。
+    """
+
+    status: str
+    detail: str = ""
+    title: str = ""
+    url: str = ""
+
+    @property
+    def passed(self):
+        return self.status == CF_PASSED
+
+    def describe(self):
+        """给 last_error / 日志用的一句话现场。"""
+        parts = [self.status]
+        if self.detail:
+            parts.append(self.detail)
+        if self.title:
+            parts.append(f"title={self.title!r}")
+        if self.url:
+            parts.append(f"url={self.url}")
+        return " | ".join(parts)
+
+    def __bool__(self):
+        return self.status == CF_PASSED
+
+
+def _title_is_challenge(title):
+    low = (title or "").lower()
+    return any(hint in low for hint in CF_CHALLENGE_TITLE_HINTS)
+
+
+def _probe_page(page):
+    """探测当前页面 → (probe, error)。probe 为 None 表示这次探测不可用
+    （页面正在导航 / 执行上下文被销毁）——**不可用 ≠ 通过**，继续等下一轮。"""
+    try:
+        probe = page.evaluate(_PROBE_JS, {
+            "challengeSel": CF_CHALLENGE_DOM_SELECTOR,
+            "readySel": PAGE_READY_DOM_SELECTOR,
+        })
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(probe, dict):
+        return None, f"探测返回非预期结构（{type(probe).__name__}）"
+    return probe, None
+
+
+def wait_cf_challenge(page, url, timeout=60, interval=2):
+    """等待 Cloudflare 挑战完成，并**如实报告结论**（返回 CfChallengeOutcome）。
+
+    判定 passed 必须同时满足三条：
+      1) page.goto 没有抛异常（导航真的发生了）；
+      2) title 非空，且不含中英挑战页特征；
+      3) 页面上出现了目标站点的正向标记（Discourse 的 #main-outlet 等）。
+    只有 (2) 而没有 (3) 不算通过 —— 「title 里没有 Just a moment」正是那条缝。
+
+    导航失败时**立即**返回 CF_NAV_FAILED，不再拿旧页的 title 去猜：goto 抛异常
+    说明目标页没打开，此时任何「看起来正常」的 title 都来自上一个页面。
+
+    计时一律走墙钟（time.time），且 deadline 锚在 goto **之前**：goto 的超时是
     playwright 驱动进程按单调钟计的，macOS 合盖休眠期间同样停走 —— 实测这个「60 秒」
     的等待跨了 28 分 46 秒墙钟。锚在 goto 之前，goto 回来后立刻复核，超了就判失败，
     不再续一轮 60 秒的循环。
@@ -175,19 +303,55 @@ def wait_cf_challenge(page, url, timeout=60):
     deadline = time.time() + timeout
     try:
         page.goto(url, timeout=timeout * 1000)
-    except Exception:
-        pass
-    while time.time() < deadline:
-        try:
-            title = page.title() or ""
-        except Exception:
-            title = ""
-        if "Just a moment" not in title and "Attention Required" not in title:
-            return True
-        time.sleep(2)
-    try:
-        title = page.title()
-    except Exception:
-        title = ""
-    log(f"⚠️ Cloudflare 挑战超时（{timeout}s），当前 title: {title}")
-    return False
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        log(f"⚠️ 导航失败（{detail}）: {url}")
+        return CfChallengeOutcome(CF_NAV_FAILED, detail, "", url)
+
+    last = CfChallengeOutcome(CF_UNCONFIRMED, "探测未执行", "", url)
+
+    while True:
+        probe, error = _probe_page(page)
+        if probe is None:
+            last = CfChallengeOutcome(CF_UNCONFIRMED, f"页面探测失败: {error}", last.title, url)
+        else:
+            title = probe.get("title") or ""
+            landed = probe.get("url") or url
+            if probe.get("challenge") or _title_is_challenge(title):
+                last = CfChallengeOutcome(CF_CHALLENGE, "仍在 Cloudflare 挑战页", title, landed)
+            elif not title.strip():
+                last = CfChallengeOutcome(CF_UNCONFIRMED, "页面 title 为空，无法确认已离开挑战页", title, landed)
+            elif probe.get("ready"):
+                return CfChallengeOutcome(CF_PASSED, "已确认通过", title, landed)
+            else:
+                last = CfChallengeOutcome(CF_UNCONFIRMED, "已离开挑战页，但不是目标站点页面", title, landed)
+
+        if time.time() >= deadline:
+            break
+        time.sleep(interval)
+
+    log(f"⚠️ Cloudflare 判据未确认通过（{timeout}s）: {last.describe()}")
+    return last
+
+    while True:
+        probe, error = _probe_page(page)
+        if probe is None:
+            last = CfChallengeOutcome(CF_UNCONFIRMED, f"页面探测失败: {error}", last.title, url)
+        else:
+            title = probe.get("title") or ""
+            landed = probe.get("url") or url
+            if probe.get("challenge") or _title_is_challenge(title):
+                last = CfChallengeOutcome(CF_CHALLENGE, "仍在 Cloudflare 挑战页", title, landed)
+            elif not title.strip():
+                last = CfChallengeOutcome(CF_UNCONFIRMED, "页面 title 为空，无法确认已离开挑战页", title, landed)
+            elif probe.get("ready"):
+                return CfChallengeOutcome(CF_PASSED, "已确认通过", title, landed)
+            else:
+                last = CfChallengeOutcome(CF_UNCONFIRMED, "已离开挑战页，但不是目标站点页面", title, landed)
+
+        if time.time() >= deadline:
+            break
+        time.sleep(interval)
+
+    log(f"⚠️ Cloudflare 判据未确认通过（{timeout}s）: {last.describe()}")
+    return last
