@@ -84,6 +84,8 @@ def normalize_datetime(value):
     return ""
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
+# 说明：BROWSER_DATA 已不再使用 —— 实际 profile 路径由 browser_utils.USER_DATA_DIR
+# 按 __file__ 定位，与 cwd 无关。保留这行只为兼容可能引用它的外部脚本。
 BROWSER_DATA = os.path.join(os.getcwd(), "browser_data")
 
 # 板块配置（与 linux_do_gui.py 保持一致）
@@ -178,15 +180,21 @@ def _plain_text(html):
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
+def _curl_requests():
+    """延迟导入 curl_cffi 并给出可读错误。"""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
+    return curl_requests
+
+
 def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=None):
     """无浏览器抓取板块 RSS。
 
     RSS 通常只包含最新 25 条，没有浏览量和回复数，但包含首帖正文。
     """
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError as exc:
-        raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
+    curl_requests = _curl_requests()
 
     url = BASE + cat["u"].rstrip("/") + ".rss"
     if page:
@@ -255,10 +263,7 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=Non
 
 
 def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError as exc:
-        raise RuntimeError("无浏览器模式需要 curl_cffi：pip install curl_cffi") from exc
+    curl_requests = _curl_requests()
 
     result = {}
     failures = []
