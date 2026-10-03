@@ -337,6 +337,9 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
         if not data or data.get("error"):
             if not retried:
                 # CF cookie 可能刚建立：等一会重试同一页，再失败才回退 DOM
+                # 已核实（POLL-78）：这里的 sleep 是**退避**，不是 deadline —— 睡眠期间
+                # 单调钟停走会让这 8s 跨成几十分钟墙钟，但轮次上限由 service.py 的
+                # 墙钟 deadline 兜底（到点 kill 整个子进程），所以不改这里的计时口径。
                 retried = True
                 err = data.get("error") if data else "空"
                 log(f"  板块[{cat['n']}] JSON 失败({err})，8s 后重试")
@@ -753,6 +756,8 @@ def main():
             log("✅ 已登录")
         else:
             log("等待登录...（最多 300s）")
+            # 已核实（POLL-78）：这里本来就是墙钟口径（time.time，休眠期间照走），
+            # 合盖醒来后第一眼就是「已过期」，不用改。
             deadline = time.time() + 300
             while time.time() < deadline:
                 if check_login(pg):

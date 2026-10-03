@@ -446,7 +446,8 @@ class WarningSurfacingTests(unittest.TestCase):
             )
             result = SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]), stderr=stderr)
             with patch.object(service, "LATEST_FILE", latest), \
-                 patch.object(service.subprocess, "run", return_value=result):
+                 patch.object(service, "STDERR_LOG_FILE", Path(directory) / "scrape_stderr.log"), \
+                 patch.object(service, "run_with_wall_clock_deadline", return_value=result):
                 ok, _ = svc.run_once("test")
             snapshot = svc.snapshot()
 
@@ -464,7 +465,8 @@ class WarningSurfacingTests(unittest.TestCase):
             result = SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]),
                                      stderr="[09:00:01] 共抓取 1 条帖子\n")
             with patch.object(service, "LATEST_FILE", latest), \
-                 patch.object(service.subprocess, "run", return_value=result):
+                 patch.object(service, "STDERR_LOG_FILE", Path(directory) / "scrape_stderr.log"), \
+                 patch.object(service, "run_with_wall_clock_deadline", return_value=result):
                 ok, _ = svc.run_once("test")
             snapshot = svc.snapshot()
 
@@ -543,16 +545,17 @@ class SchedulerResilienceTests(unittest.TestCase):
             root = Path(directory)
             svc = self.build(SCRAPE_MODE="rss", DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
 
-            def fake_run(command, **kwargs):
+            def fake_run(command, timeout, **kwargs):
                 if str(command[1]).endswith("daily_report.py"):
                     # 镜像里没 COPY daily_report.py 时的等价场景
                     raise FileNotFoundError(2, "No such file or directory", "daily_report.py")
                 return SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]), stderr="")
 
             with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "STDERR_LOG_FILE", root / "scrape_stderr.log"), \
                  patch.object(service, "DATA_DIR", root), \
                  patch.object(service, "REPORT_DIR", root / "reports"), \
-                 patch.object(service.subprocess, "run", side_effect=fake_run):
+                 patch.object(service, "run_with_wall_clock_deadline", side_effect=fake_run):
                 ok, _ = svc.run_once("schedule")
 
             snapshot = svc.snapshot()
@@ -585,6 +588,207 @@ class SchedulerResilienceTests(unittest.TestCase):
         self.assertIn("FileNotFoundError", snapshot["last_error"])
         self.assertIn("调度线程继续运行", snapshot["last_error"])
         self.assertIsNone(snapshot["next_run_at"])             # 退出时清理干净
+
+
+class WallClockDeadlineTests(unittest.TestCase):
+    """POLL-78：轮次时限改墙钟口径。
+
+    macOS 合盖休眠会冻结单调钟，subprocess.run(timeout=) 因此永远够不到上限
+    （2026-09-29T20:11Z 那轮墙钟跑了 5h32m54s，进程内只累计 123s）。下面用
+    「把 subprocess 的单调钟钉死」在进程内等价复现这个冻结。
+    """
+
+    @staticmethod
+    def freeze_monotonic():
+        # subprocess 在 import 时就把 time.monotonic 绑成了 subprocess._time，
+        # 改 time.monotonic 打不到它，必须改这个绑定。
+        return patch.object(service.subprocess, "_time", lambda: 0.0)
+
+    def test_frozen_monotonic_defeats_plain_run_timeout(self):
+        """改前的跑法：单调钟冻住时 0.5s 的上限形同虚设。"""
+        child = [sys.executable, "-c", "import time; time.sleep(2)"]
+        started = time.time()
+        with self.freeze_monotonic():
+            completed = service.subprocess.run(child, capture_output=True, text=True, timeout=0.5)
+        self.assertEqual(0, completed.returncode)          # 没被 timeout 拦下
+        self.assertGreater(time.time() - started, 1.5)     # 老老实实等完了 2s
+
+    def test_wall_clock_deadline_fires_under_the_same_freeze(self):
+        """改后的跑法：同样的冻结下照常到点 kill（改前没有这个函数，直接失败）。"""
+        child = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with self.freeze_monotonic():
+            started = time.time()
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                service.run_with_wall_clock_deadline(child, timeout=1, tick=0.2)
+            elapsed = time.time() - started
+        self.assertEqual(1, caught.exception.timeout)
+        self.assertLess(elapsed, 5)
+
+    def test_wall_clock_deadline_judges_on_wake_instead_of_waiting_again(self):
+        """合盖 → 唤醒：墙钟一次跳了几千秒，第一眼就判定超时，不按剩余时间续命。"""
+        child = [sys.executable, "-c", "import time; time.sleep(10)"]
+        real_time = time.time
+        started = real_time()
+        awake = {"still_dreaming": True}
+
+        def jumped():
+            if awake["still_dreaming"] and real_time() - started > 0.3:
+                awake["still_dreaming"] = False     # 这一刻唤醒，墙钟一次跳掉 4000 秒
+            return real_time() if awake["still_dreaming"] else real_time() + 4000
+
+        with patch.object(service.time, "time", jumped):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                service.run_with_wall_clock_deadline(child, timeout=60, tick=0.2)
+        self.assertLess(real_time() - started, 5)
+
+
+class RoundTimeoutBehaviourTests(unittest.TestCase):
+    """POLL-78 验收 2：到点 kill、last_error 文案、runs +1；追加交付物：完整 stderr 落盘。"""
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    def test_round_times_out_on_wall_clock_and_kills_the_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "child-survived.txt"
+            svc = self.build(SCRAPE_MODE="rss")
+            svc.timeout = 1          # 配置下限是 60s，测试里直接改属性
+            log_file = root / "scrape_stderr.log"
+            # 子进程先吐一段长 stderr（超过 /status 的 2000 字符尾部上限）再挂住，
+            # 跑完 30 秒才写 marker —— 到点没被 kill 的话 marker 就会留下。
+            svc.command = lambda: [
+                sys.executable, "-c",
+                "import sys, time;"
+                "sys.stderr.write('板块[x] 开始抓取\\n' * 500);"
+                "sys.stderr.flush();"
+                "time.sleep(30);"
+                "open(sys.argv[1], 'w').write('x')",
+                str(marker),
+            ]
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "STDERR_LOG_FILE", log_file):
+                started = time.time()
+                ok, message = svc.run_once("test")
+                elapsed = time.time() - started
+            kept = log_file.read_text(encoding="utf-8")
+            snapshot = svc.snapshot()
+
+        self.assertFalse(ok)
+        self.assertEqual("scrape timed out after 1s", message)
+        self.assertEqual("scrape timed out after 1s", snapshot["last_error"])
+        self.assertEqual("error", snapshot["status"])
+        self.assertEqual(1, snapshot["runs"])
+        self.assertIsNotNone(snapshot["last_finished_at"])
+        self.assertLess(elapsed, 15)          # 到点就收口，不再「跨过 N×容差还活着」
+        self.assertFalse(marker.exists())     # 子进程确实被 kill 了
+        # 超时这条路上，子进程死前的 stderr 也整段留下了（头部不截）
+        self.assertGreater(len(kept), service.MAX_STDERR_KEPT)
+        self.assertIn("板块[x] 开始抓取", kept)
+        self.assertEqual(len(kept), snapshot["last_stderr_bytes"])
+
+    def test_full_stderr_is_kept_beyond_the_status_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_file = root / "scrape_stderr.log"
+            long_stderr = "".join(f"[09:00:{i % 60:02d}] 板块[{i}] 开始抓取\n" for i in range(400))
+            svc = self.build(SCRAPE_MODE="rss")
+            result = SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]),
+                                     stderr=long_stderr)
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "STDERR_LOG_FILE", log_file), \
+                 patch.object(service, "run_with_wall_clock_deadline", return_value=result):
+                ok, _ = svc.run_once("test")
+            kept = log_file.read_text(encoding="utf-8")
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)
+        self.assertEqual(long_stderr, kept)                     # 一字不少
+        self.assertIn("板块[0] 开始抓取", kept)                  # 最早那几行正是被切掉的那些
+        self.assertGreater(len(kept), service.MAX_STDERR_KEPT)   # 确实超过 /status 的尾部上限
+        self.assertLessEqual(len(snapshot["last_stderr"]), service.MAX_STDERR_KEPT)
+        self.assertEqual(len(kept), snapshot["last_stderr_bytes"])
+        self.assertTrue(snapshot["stderr_log_file"].endswith("scrape_stderr.log"))
+
+
+class RoundScheduleTests(unittest.TestCase):
+    """POLL-78 验收 2：next_run_at 按**轮次起点**顺延，不被收口时刻推后。"""
+
+    def build(self, **env):
+        with patch.dict(os.environ, env):
+            return service.ScrapeService()
+
+    def test_next_run_at_is_anchored_on_the_round_start(self):
+        t0 = datetime(2026, 9, 30, 0, 0, 0, tzinfo=timezone.utc)
+        round_duration = timedelta(hours=5, minutes=32, seconds=54)   # 合盖那轮的墙钟耗时
+        svc = self.build(SCRAPE_MODE="rss", SCRAPE_INTERVAL_SECONDS="21600")   # 6h
+        clock = {"now": t0}
+        announced = []
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock["now"]
+
+        def fake_wait_until(due, tick=30):
+            if len(announced) >= 2:          # 两轮够了，退出调度循环
+                return False
+            clock["now"] = due               # 墙钟走到点
+            return True
+
+        def fake_run_once(trigger):
+            announced.append(svc.snapshot()["next_run_at"])
+            clock["now"] += round_duration
+            return True, "ok"
+
+        with patch.object(svc, "should_run_on_start", return_value=True), \
+             patch.object(svc, "run_once", side_effect=fake_run_once), \
+             patch.object(svc, "wait_until", side_effect=fake_wait_until), \
+             patch.object(service, "datetime", FakeDatetime):
+            svc.scheduler()
+
+        def at(hours):
+            return (t0 + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+        # 第 1 轮起点 t0 → 下一轮 t0+6h；第 2 轮起点 t0+6h → 再下一轮 t0+12h。
+        # 旧口径第 2 轮报的是 t0+11h32m54s（收口时刻 + 6h）—— 节奏被轮次耗时推着走。
+        self.assertEqual([at(6), at(12)], announced)
+
+
+class CfChallengeWallClockTests(unittest.TestCase):
+    """POLL-78：CF 挑战等待（同源处）核实 —— 墙钟口径，且 deadline 覆盖 goto 本身。"""
+
+    @staticmethod
+    def browser_utils_without_playwright():
+        """browser_utils 顶层就 import playwright（CI 没装），先塞个假的进 sys.modules。"""
+        fake = SimpleNamespace(sync_playwright=lambda: None)
+        with patch.dict("sys.modules", {
+            "playwright": SimpleNamespace(sync_api=fake),
+            "playwright.sync_api": fake,
+        }):
+            import browser_utils
+        return browser_utils
+
+    def test_goto_overrun_is_counted_against_the_same_deadline(self):
+        browser_utils = self.browser_utils_without_playwright()
+        clock = {"now": 1000.0}
+
+        def fake_time():
+            clock["now"] += 30           # 每次读表都往前 30 秒
+            return clock["now"]
+
+        def goto(url, timeout=None):
+            clock["now"] += 3600         # 合盖：goto 内部按单调钟计时，60s 跨成 1 小时墙钟
+
+        page = SimpleNamespace(goto=goto, title=lambda: "Just a moment...")
+        started = time.time()
+        with patch.object(browser_utils.time, "time", fake_time):
+            ok = browser_utils.wait_cf_challenge(page, "https://linux.do/t/1", timeout=60)
+        elapsed = time.time() - started
+
+        self.assertFalse(ok)             # goto 已经超了，不再续一轮 60 秒的循环
+        self.assertLess(elapsed, 1.0)
 
 
 class ReadEndpointAuthTests(unittest.TestCase):

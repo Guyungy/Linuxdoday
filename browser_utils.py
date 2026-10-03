@@ -91,6 +91,9 @@ def wait_json_ready(page, slug="develop/4", timeout=90, interval=3):
 
     刚 launch_persistent_context + goto 后立刻 fetch 常拿到 403（cf_clearance
     还没完全生效），等几秒后即正常。返回 True/False。
+
+    计时用 time.time（墙钟，休眠期间照走），不用单调钟：deadline 在进循环前锚定，
+    合盖醒来后第一眼就是「已过期」，不会白等第二轮 timeout。
     """
     deadline = time.time() + timeout
     last = None
@@ -162,12 +165,18 @@ def check_session(page, retries=3, interval=4, goto=True):
 
 
 def wait_cf_challenge(page, url, timeout=60):
-    """等待 Cloudflare 挑战完成（title 不再含 'Just a moment'）"""
+    """等待 Cloudflare 挑战完成（title 不再含 'Just a moment'）。
+
+    计时一律走墙钟（time.time），并且 deadline 锚在 goto **之前**：goto 的超时是
+    playwright 驱动进程按单调钟计的，macOS 合盖休眠期间同样停走 —— 实测这个「60 秒」
+    的等待跨了 28 分 46 秒墙钟。锚在 goto 之前，goto 回来后立刻复核，超了就判失败，
+    不再续一轮 60 秒的循环。
+    """
+    deadline = time.time() + timeout
     try:
         page.goto(url, timeout=timeout * 1000)
     except Exception:
         pass
-    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             title = page.title() or ""
@@ -176,5 +185,9 @@ def wait_cf_challenge(page, url, timeout=60):
         if "Just a moment" not in title and "Attention Required" not in title:
             return True
         time.sleep(2)
-    log(f"⚠️ Cloudflare 挑战超时（{timeout}s），当前 title: {page.title()}")
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    log(f"⚠️ Cloudflare 挑战超时（{timeout}s），当前 title: {title}")
     return False
