@@ -111,7 +111,7 @@ def fetch_content(pg, row):
         const {slug, tid} = args;
         try {
             const url = "/t/" + slug + "/" + tid + ".json";
-            const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}});
+            const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}, signal: AbortSignal.timeout(30000)});
             if (!r.ok) return {error: "HTTP " + r.status};
             return await r.json();
         } catch(e) { return {error: String(e)}; }

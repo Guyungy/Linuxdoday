@@ -71,7 +71,12 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
     """
     kill_stale_chrome()
     p = sync_playwright().start()
-    args = ["--disable-blink-features=AutomationControlled"]
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+    ]
     if offscreen and not headless:
         # 移到可视区域之外；窗口仍存在，只是用户看不见
         args += ["--window-position=-2400,-2400", "--window-size=1280,900"]
@@ -84,6 +89,20 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
         viewport={"width": 1920, "height": 1080},
     )
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    if offscreen and not headless:
+        # macOS 不一定遵守 --window-position；最小化专用窗口，避免遮挡桌面。
+        session = None
+        try:
+            session = ctx.new_cdp_session(page)
+            window = session.send("Browser.getWindowForTarget")
+            session.send("Browser.setWindowBounds", {
+                "windowId": window["windowId"], "bounds": {"windowState": "minimized"},
+            })
+        except Exception as exc:
+            log(f"窗口最小化未成功（继续离屏运行）: {type(exc).__name__}")
+        finally:
+            if session:
+                session.detach()
     return ctx, page
 
 

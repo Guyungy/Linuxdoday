@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Linux.do 顺序阅读助手
 // @namespace    linuxdoday
-// @version      1.0.0
+// @version      1.1.0
 // @description  使用当前登录账号实时收集新话题，顺序打开与滚动；支持暂停和断点继续。
 // @match        https://linux.do/*
 // @grant        none
@@ -13,6 +13,7 @@
   if (window.top !== window.self) return;
   const KEY = 'linuxdoday.reader.v1';
   const LOCK = `${KEY}.owner`;
+  const TAB = `${KEY}.activeTab`;
   const owner = `${Date.now()}-${Math.random()}`;
   let state;
   try { state = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (_) {}
@@ -29,13 +30,18 @@
   };
   const panel = document.createElement('div');
   panel.style.cssText = 'position:fixed;right:12px;top:90px;z-index:2147483647;width:255px;padding:12px;background:#fff;color:#222;border:1px solid #aaa;border-radius:10px;box-shadow:0 3px 16px #0003;font:14px/1.6 system-ui';
-  panel.innerHTML = '<b>Linux.do 顺序阅读</b><div data-status></div><label>主题数 <input data-target type="number" min="1" max="2000" style="width:65px"></label> <label>停留秒 <input data-seconds type="number" min="10" max="120" style="width:55px"></label><div style="margin-top:8px"><button data-start>新一批</button> <button data-resume>继续</button> <button data-pause>暂停</button></div><small>实时新话题 · 当前登录账号<br>验证时暂停；计数以 Connect 为准。</small>';
+  panel.innerHTML = '<button data-toggle style="width:100%">阅读助手 · 展开</button><div data-controls hidden><div data-status></div><label>主题数 <input data-target type="number" min="1" max="2000" style="width:65px"></label> <label>停留秒 <input data-seconds type="number" min="10" max="120" style="width:55px"></label><div style="margin-top:8px"><button data-start>新一批</button> <button data-resume>继续</button> <button data-pause>暂停</button></div><small>仅在启动标签运行，不切换焦点或新开窗口。<br>后台计数以 Connect 为准。</small></div>';
   document.body.append(panel);
   const status = panel.querySelector('[data-status]');
   const target = panel.querySelector('[data-target]');
   const seconds = panel.querySelector('[data-seconds]');
   target.value = state.target;
   seconds.value = state.seconds;
+  panel.querySelector('[data-toggle]').onclick = () => {
+    const controls = panel.querySelector('[data-controls]');
+    controls.hidden = !controls.hidden;
+    panel.querySelector('[data-toggle]').textContent = `阅读助手 · ${controls.hidden ? '展开' : '收起'}`;
+  };
   function render() {
     status.textContent = `${state.running ? '运行中' : '已暂停'} · ${state.done}/${state.target} · 已选 ${state.queue.length} 条\n${state.message}`;
     status.style.whiteSpace = 'pre-line';
@@ -47,12 +53,13 @@
     state.running = false;
     state.message = message;
     save();
+    sessionStorage.removeItem(TAB);
     if (JSON.parse(localStorage.getItem(LOCK) || 'null')?.owner === owner) localStorage.removeItem(LOCK);
   };
   function claim() {
     let lock;
     try { lock = JSON.parse(localStorage.getItem(LOCK) || 'null'); } catch (_) {}
-    if (lock && lock.owner !== owner && Date.now() - lock.time < 12000) {
+    if (lock && lock.owner !== owner && Date.now() - lock.time < 120000) {
       state.running = false;
       state.message = '另一个标签正在运行，请先在那里暂停。';
       render();
@@ -75,6 +82,7 @@
     state = { running: true, queue: [], done: 0, target: Math.min(2000, Math.max(1, Number(target.value) || 200)), seconds: Math.min(120, Math.max(10, Number(seconds.value) || 20)), page: 0, phase: 'collect', message: '实时加载新话题' };
     cancelled = false;
     if (!claim()) return;
+    sessionStorage.setItem(TAB, '1');
     save();
     location.assign('/new');
   };
@@ -82,12 +90,13 @@
     state.running = true;
     cancelled = false;
     if (!claim()) return;
+    sessionStorage.setItem(TAB, '1');
     save();
     location.assign(state.phase === 'read' ? state.queue[state.done] : `/new?page=${state.page}`);
   };
   render();
   async function run() {
-    if (!state.running || !claim()) return;
+    if (!state.running || sessionStorage.getItem(TAB) !== '1' || !claim()) return;
     const heartbeat = setInterval(() => {
       if (!cancelled) localStorage.setItem(LOCK, JSON.stringify({ owner, time: Date.now() }));
     }, 3000);

@@ -214,9 +214,11 @@ def main():
 
         def _created(row):
             try:
-                return datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00"))
             except ValueError:
                 return None
+            # 无时区的 created_at 会变成 naive datetime，与 aware 的 cutoff 比较会崩
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
         todo = [r for r in rows if (_created(r) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
     if todo is None:

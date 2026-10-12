@@ -312,7 +312,7 @@ def scrape_all_rss(cats, limit=0, proxy=None, pages=1):
 # ---------------------------------------------------------------------------
 # 抓取
 # ---------------------------------------------------------------------------
-def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
+def scrape_category(pg, cat, limit=0, page_delay=(1, 2), max_pages=40):
     """抓取单个板块的话题（浏览器内 fetch Discourse JSON，带登录 cookie 绕过 CF）。
 
     用 /c/<slug>.json 的 JSON API，page=N 分页，字段结构化（作者/回复/浏览/时间/分类）。
@@ -326,7 +326,8 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
 
     while page_num < max_pages:
         page_num += 1
-        time.sleep(random.uniform(*page_delay))
+        if page_num > 1:
+            time.sleep(random.uniform(*page_delay))
 
         # 浏览器内 fetch 同源 JSON（带 cookie 绕过 CF）
         data = pg.evaluate("""
@@ -334,7 +335,7 @@ def scrape_category(pg, cat, limit=0, page_delay=(2, 4), max_pages=40):
             const {categoryPath, page} = args;
             try {
                 const url = categoryPath + ".json?page=" + page;
-                const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}});
+                const r = await fetch(url, {credentials: "include", headers: {"Accept": "application/json"}, signal: AbortSignal.timeout(30000)});
                 if (!r.ok) return {error: "HTTP " + r.status};
                 return await r.json();
             } catch(e) { return {error: String(e)}; }
@@ -577,7 +578,7 @@ def scrape_all(pg, cats, limit=0, max_pages=40):
         topics = scrape_category(pg, cat, limit=limit, max_pages=max_pages)
         result[cat["n"]] = topics
         log(f"  → 板块[{cat['n']}] 共 {len(topics)} 条")
-        time.sleep(random.uniform(1, 2))
+        time.sleep(random.uniform(0.5, 1))
     return result
 
 
@@ -870,7 +871,7 @@ def main():
                         res = {"content": content, "author_raw": row.get("author", ""),
                                "fetched_at": datetime.now().isoformat(timespec="seconds")}
                     else:
-                        time.sleep(random.uniform(2, 4))
+                        time.sleep(random.uniform(1, 2))
                         res = _fc(pg, row)
                     if res:
                         contents[str(row.get("id"))] = res

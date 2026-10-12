@@ -125,7 +125,9 @@ python linux_do_scraper.py --browse      # 首次人工登录，登录态存入 
 SCRAPE_MODE=browser python service.py
 ```
 
-browser 模式下抓取窗口默认移到屏幕外（`--window-position=-2400,-2400`），不抢焦点、不遮挡桌面；只有 `--browse` 才会弹出可见窗口。
+browser 模式下抓取窗口默认移到屏幕外，并尝试最小化专用窗口；只有 `--browse` 才会弹出可见窗口。macOS 启动 Chrome 时仍可能短暂激活窗口，完全无桌面窗口可使用服务器上的 Xvfb 或 RSS 模式。
+
+自动抓取第一页直接请求，后续页面间隔 1–2 秒；正文请求间隔 1–2 秒。列表与正文 JSON 请求超时为 30 秒，避免单页无限等待。最小化时关闭 Chrome 后台计时降速；失败重试和原有分页深度保持不变。
 
 只执行一次、不启动 HTTP 服务：
 

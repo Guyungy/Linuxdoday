@@ -58,6 +58,16 @@ def load_browser_utils():
 
 
 class ScraperTests(unittest.TestCase):
+    def test_browser_waits_only_between_pages_and_bounds_requests(self):
+        page = SimpleNamespace(evaluate=unittest.mock.Mock(side_effect=[
+            {"topic_list": {"topics": [{"id": 1}], "more_topics_url": "/next"}},
+            {"topic_list": {"topics": []}},
+        ]))
+        with patch.object(scraper.time, "sleep") as sleep:
+            scraper.scrape_category(page, {"n": "A", "u": "/c/a/1"}, page_delay=(1, 1))
+        sleep.assert_called_once_with(1)
+        self.assertIn("AbortSignal.timeout(30000)", page.evaluate.call_args_list[0].args[0])
+
     def test_browser_uses_full_category_path(self):
         class Page:
             def evaluate(self, script, args):
