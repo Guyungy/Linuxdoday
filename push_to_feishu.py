@@ -20,12 +20,12 @@ push_to_feishu.py — 把抓取的帖子数据写入飞书多维表格（增量�
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
+
+from common import normalize_datetime
 
 DEFAULT_BASE_TOKEN = "LYdZbR3DTaFPeYsHP8ScqPVCnFe"
 DEFAULT_TABLE = "帖子主题"
@@ -34,42 +34,9 @@ BATCH = 200  # lark-cli 单次最大 200
 # 飞书 datetime 字段只吃 RFC3339 或 "YYYY-MM-DD HH:MM:SS"，喂别的直接 800010403
 # invalid_request；而 record-batch-create 是整批原子的 —— 一条脏值废掉整批 200 条
 # （2026-10-01 那次 937 条全灭就是被 29 条脏时间拖的：DOM 回退把标签文本写进了时间字段）。
-# 所以所有时间在写入前统一过这道闸，认不出来就返回空串（飞书侧即留空）。
-# 见 linux_do_scraper.py 的同名函数，两处口径必须一致。
-_DT_ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
-_DT_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
-_DT_CN_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\D*(\d{1,2})?\s*[:：]?\s*(\d{1,2})?")
+# 归一化实现已收到 common.normalize_datetime：抓取端与写入端必须同一口径，
+# 靠「两处注释都说要一致」是保不住的，副本已经漂移过一次。
 DATETIME_FIELDS = ("发布时间", "最近活跃")
-
-
-def normalize_datetime(value):
-    """把时间值收敛成飞书 datetime 字段能接受的字符串；认不出来返回 ""。"""
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    if re.match(r"^\d{10,13}$", text):
-        try:
-            stamp = int(text)
-            if stamp > 10 ** 12:
-                stamp //= 1000
-            return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, OverflowError, OSError):
-            return ""
-    m = _DT_ISO_RE.match(text)
-    if m:
-        year, month, day, hour, minute, second = m.groups()
-        return f"{year}-{month}-{day} {hour}:{minute}:{second or '00'}"
-    m = _DT_DATE_RE.match(text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} 00:00:00"
-    m = _DT_CN_RE.search(text)
-    if m:
-        year, month, day = m.group(1), int(m.group(2)), int(m.group(3))
-        hour, minute = int(m.group(4) or 0), int(m.group(5) or 0)
-        return f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
-    return ""
 
 
 def sanitize_rows(rows):

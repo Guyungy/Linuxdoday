@@ -20,16 +20,13 @@ import os
 import sys
 from datetime import datetime
 
+from common import PROXY_DEFAULT, SOURCE_HOT, log, now_iso, topic_row, write_json_atomic
+
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HOT_FILE = os.path.join(DATA_DIR, "hot_topics.json")
 CATEGORY_FILE = os.path.join(DATA_DIR, "category_map.json")
 PERIODS = ("daily", "weekly", "monthly")
-
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 def load_category_map(pg=None):
@@ -69,35 +66,33 @@ def fetch_period(pg, period):
     return data.get("topics") or []
 
 
-def normalize(raw, category_names=None):
-    """转成与 linux_do_scraper 一致的字段，便于合并进缓存或直接展示。"""
+def normalize(raw, category_names=None, metrics_at=None):
+    """转成与 linux_do_scraper 一致的字段，便于合并进缓存或直接展示。
+
+    公共字段走 common.topic_row（两个入口必须同一口径）；这里只负责把热榜端
+    特有的来源解析好传进去 —— posters 直接带 username，所以不需要抓取端那张
+    user_id→username 反查表。
+
+    来源显式标 SOURCE_HOT：热榜行有 posters，靠形状回推本来也会判成 browser，
+    但「browser」是错的 —— 它来自 /top.json，不是浏览器内 fetch 板块 JSON。
+    日报按来源分档，把两者混为一谈会让「指标从哪看的」这一列说谎。
+    metrics_at 由 collect 每轮传一次（不在这里取 now），保证同一轮所有行
+    的时间戳完全一致。
+    """
     category_names = category_names or {}
     out = []
     for t in raw:
-        tid = str(t.get("id", ""))
         posters = t.get("posters") or []
-        author = (posters[0].get("username") or "") if posters else ""
-        slug = t.get("slug") or ""
-        out.append({
-            "id": tid,
-            "title": (t.get("title") or "")[:200],
-            "url": f"/t/{slug}/{tid}" if slug else f"/t/topic/{tid}",
-            "replies": int(t.get("reply_count") or 0),
-            "views": int(t.get("views") or 0),
-            "author": author,
-            "created_at": t.get("created_at") or "",
-            "bumped_at": t.get("bumped_at") or "",
-            "slug": slug,
-            "like_count": int(t.get("like_count") or 0),
-            "posts_count": int(t.get("posts_count") or 0),
-            "posters": [p.get("username") or "" for p in posters],
-            "last_poster": (posters[-1].get("username") or "") if posters else "",
-            "category_id": t.get("category_id") or "",
-            "category": category_names.get(str(t.get("category_id")), ""),
-            "tags_raw": [x for x in (t.get("tags") or []) if isinstance(x, str)],
-            "pinned": bool(t.get("pinned")),
-            "visible": bool(t.get("visible")),
-        })
+        usernames = [p.get("username") or "" for p in posters]
+        out.append(topic_row(
+            t,
+            author=usernames[0] if usernames else "",
+            posters=usernames,
+            last_poster=usernames[-1] if usernames else "",
+            category=category_names.get(str(t.get("category_id")), ""),
+            source=SOURCE_HOT,
+            metrics_at=metrics_at or now_iso(),
+        ))
     return out
 
 
@@ -114,10 +109,12 @@ def collect(pg, periods=("daily", "weekly"), limit=0):
     category_names = load_category_map(pg)
     errors = []
     result = {"generated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    # 本轮观测时刻：一轮只取一次，所有周期的行共用同一个值。
+    collected_at = now_iso()
     for period in periods:
         request_failed = False
         try:
-            topics = normalize(fetch_period(pg, period), category_names)
+            topics = normalize(fetch_period(pg, period), category_names, metrics_at=collected_at)
         except Exception as exc:
             errors.append(f"[{period}] 请求失败: {exc}")
             log(f"⚠️ 热榜[{period}]抓取失败: {exc}")
@@ -138,11 +135,7 @@ def collect(pg, periods=("daily", "weekly"), limit=0):
 
 
 def save(payload):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    temporary = HOT_FILE + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=1)
-    os.replace(temporary, HOT_FILE)
+    write_json_atomic(HOT_FILE, payload)
     return HOT_FILE
 
 

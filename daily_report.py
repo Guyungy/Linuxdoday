@@ -22,14 +22,17 @@ daily_report.py — 生成 Linux.do 的 AI 日报（分析 + 总结）
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+
+import report_status
+from common import load_json, log as _log_utc8, write_text_atomic
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
@@ -55,15 +58,12 @@ THEMES = {
 
 
 def log(msg):
-    print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+    """日报日志固定走 UTC+8。
 
-
-def load_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default
+    窗口、文件名、正文日期全是 UTC+8 口径；日志若跟机器本地时区走，
+    在容器（UTC）里就会出现「日志说 12:00、报告说 20:00」的对不上。
+    """
+    _log_utc8(msg, tz=TZ)
 
 
 def parse_time(value):
@@ -514,7 +514,11 @@ def main():
             log(f"⚠️ 日报文件不存在: {path}")
             return 1
         with open(path, "r", encoding="utf-8") as f:
-            markdown = f.read()
+            raw = f.read()
+        # 首行的状态标记是给 service.py 读的，不要跟着推给飞书。
+        markdown = report_status.body(raw)
+        if report_status.is_degraded(raw):
+            log("⚠️ 这份日报状态不是 ok（降级或旧格式无标记），仍按你的要求推送")
         label = f"（近 {args.days} 天）" if args.days > 1 else ""
         headline = f"Linux.do AI 日报 · {day}{label}"
         subtitle = _window_subtitle(markdown, day, args.days)
@@ -541,6 +545,9 @@ def main():
     log(f"{overview['start']} ~ {overview['end']}：{len(rows)} 帖（含正文 {overview['with_content']} 条）")
 
     narrative, usage = "", {}
+    # degraded = 这份日报不是「模型分析正常产出」的。--no-llm 是运维显式选择，不算降级；
+    # 凭据缺失和调用失败都算 —— 它们产出的只是一份占位报告，旧版却照样 return 0。
+    degraded, degrade_reason = False, ""
     if args.no_llm:
         narrative = "## ⚡ 高价值信息\n\n（本次未启用模型分析，下面是自动生成的话题汇总与热帖）\n"
     else:
@@ -548,20 +555,24 @@ def main():
         if not api_key:
             log("⚠️ 未找到 API key（DAILY_REPORT_API_KEY 或 ~/.dsh/.credentials.yaml），降级为统计版")
             args.no_llm = True
+            degraded, degrade_reason = True, "no_credentials"
             narrative = "## ⚡ 高价值信息\n\n（未找到模型凭据，下面是自动生成的话题汇总与热帖）\n"
         else:
             try:
                 narrative, usage = call_llm(build_prompt(rows, overview, args.top),
                                             api_key, args.base_url, args.model)
                 log(f"模型 {args.model} 返回 {len(narrative)} 字，用量 {usage.get('total_tokens', '?')} tokens")
-            except (urllib.error.URLError, KeyError, ValueError) as exc:
+            except (OSError, http.client.HTTPException, KeyError, IndexError, ValueError) as exc:
+                # 失败形态远不止 URLError：402/403 走 HTTPError，而 HTTPError 是 OSError 子类；
+                # 网关返回 5xx 或非 JSON 会抛 HTTPException / ValueError；响应结构变了会抛
+                # KeyError / IndexError。旧版只接 URLError，漏网的异常直接冒到 main 外层，
+                # 连这份占位报告都写不出来。
                 log(f"⚠️ 模型调用失败（{exc}），降级为统计版")
+                degraded, degrade_reason = True, "llm_failed"
                 narrative = f"## ⚡ 高价值信息\n\n（模型调用失败：{exc}）\n"
 
-    daily_hot = (hot.get("daily") or [])
     label = f"（近 {args.days} 天）" if args.days > 1 else ""
     headline = f"Linux.do AI 日报 · {day}{label}"
-    subtitle = ""
     parts = [f"# {headline}", "",
              f"> {overview['start']} ~ {overview['end']}（近 {args.days} 天）｜{len(rows)} 帖"
              f"（上一窗口 {overview.get('prev_posts', 0)}）",
@@ -571,15 +582,26 @@ def main():
              "*由 Linuxdoday 抓取管线自动生成：帖子/指标来自板块抓取，正文来自 `/t/<slug>/<id>.json`。*"]
 
     markdown = "\n".join(parts)
+    # 卡片副标题取自报告正文的 `>` 窗口行，必须在 markdown 拼好之后才算；
+    # 旧版这里写死 ""，于是 service.py 推的卡片永远缺「起 ~ 止」那行现场。
+    subtitle = _window_subtitle(markdown, day, args.days)
     if args.dry_run:
         print(markdown[:2000])
-        return 0
+        return report_status.EXIT_DEGRADED if degraded else 0
 
-    os.makedirs(REPORT_DIR, exist_ok=True)
     path = os.path.join(REPORT_DIR, f"AI日报-{day}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(markdown)
-    log(f"日报已写入 {path}")
+    # 首行落状态标记：service.py 靠它判断「今天到底有没有一份真正成功的日报」。
+    status = report_status.DEGRADED if degraded else report_status.OK
+    # 原子替换（先写 .tmp 再 os.replace）：读者要么看到旧完整版，要么看到新完整版，
+    # 不会读到写了一半的文件 —— service.py 的 /status 与飞书推送都在读这个目录。
+    write_text_atomic(path, report_status.marker(status, degrade_reason) + "\n" + markdown)
+    log(f"日报已写入 {path}（{status}{'：' + degrade_reason if degrade_reason else ''}）")
+
+    if degraded:
+        # 降级版不推送：推出去的就是一份「模型调用失败」的占位文案。退出码也必须非零，
+        # 否则 service.py 会把它记成「今天已完成」，当天再也不会重试。
+        log(f"⚠️ 日报降级（{degrade_reason}），不推送飞书；退出码 {report_status.EXIT_DEGRADED}")
+        return report_status.EXIT_DEGRADED
 
     if args.push_chat:
         try:

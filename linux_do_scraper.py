@@ -33,55 +33,37 @@ import re
 import sys
 import time
 import random
-from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from xml.etree import ElementTree
+
+from common import (
+    PROXY_DEFAULT,
+    SOURCE_BROWSER,
+    SOURCE_DOM,
+    SOURCE_RSS,
+    UNOBSERVED_FIELDS,
+    WARN_PREFIX,
+    extract_warnings,
+    log,
+    normalize_datetime,
+    now_iso,
+    source_of,
+    topic_row,
+    warn,
+    write_json_atomic,
+)
+
+# 本轮采集时刻。抓取器每轮是一个全新子进程，所以模块级取一次就等于「本轮时刻」，
+# 不必层层传参，也保证同一批行的 metrics_at 完全一致（否则同一轮里各板块的
+# 行会带上互相差几秒的时间戳，读起来像多次采集）。
+RUN_COLLECTED_AT = now_iso()
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 
-# 飞书 datetime 字段只吃 RFC3339 或 "YYYY-MM-DD HH:MM:SS"，喂别的直接 800010403
-# invalid_request；而 record-batch-create 是整批原子的 —— 一条脏值废掉整批 200 条
-# （2026-10-01 那次 937 条全灭就是被 29 条脏时间拖的）。
-# 所以所有时间出站前统一过这道闸，认不出来就返回空串（飞书侧即留空）。
-# 见 push_to_feishu.py 的同名函数，两处口径必须一致。
-_DT_ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
-_DT_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
-_DT_CN_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\D*(\d{1,2})?\s*[:：]?\s*(\d{1,2})?")
-
-
-def normalize_datetime(value):
-    """把抓来的时间值收敛成飞书 datetime 字段能接受的字符串；认不出来返回 ""。"""
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    if re.match(r"^\d{10,13}$", text):
-        try:
-            stamp = int(text)
-            if stamp > 10 ** 12:
-                stamp //= 1000
-            return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, OverflowError, OSError):
-            return ""
-    m = _DT_ISO_RE.match(text)
-    if m:
-        year, month, day, hour, minute, second = m.groups()
-        return f"{year}-{month}-{day} {hour}:{minute}:{second or '00'}"
-    m = _DT_DATE_RE.match(text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} 00:00:00"
-    m = _DT_CN_RE.search(text)
-    if m:
-        year, month, day = m.group(1), int(m.group(2)), int(m.group(3))
-        hour, minute = int(m.group(4) or 0), int(m.group(5) or 0)
-        return f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
-    return ""
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
 # 说明：BROWSER_DATA 已不再使用 —— 实际 profile 路径由 browser_utils.USER_DATA_DIR
@@ -113,45 +95,9 @@ CATS = [
 ]
 
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
-
-
-# 「本轮有降级、但没到失败」的现场标记。service.py 只在 returncode!=0 时才读 stderr，
-# 成功分支会把 stderr 整段丢掉 —— 于是热榜/正文抓失败的证据采集了却查不到。
-# 带此前缀的行由 service.py 捞出来写进 /status 的 last_error。
-WARN_PREFIX = "WARN: "
-
-
-def warn(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {WARN_PREFIX}{msg}", file=sys.stderr, flush=True)
-
-
 # ---------------------------------------------------------------------------
 # 浏览器
 # ---------------------------------------------------------------------------
-def kill_stale_chrome():
-    """清理残留 Chrome：以 browser_data 为 user-data-dir 的实例会锁 profile"""
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", "browser_data"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-        if out:
-            for pid in out.splitlines():
-                try:
-                    os.kill(int(pid), 15)
-                except Exception:
-                    pass
-            log(f"已清理残留 Chrome 进程: {out.replace(chr(10), ', ')}")
-            time.sleep(2)
-    except Exception:
-        pass
-
-
 def start_browser(proxy=None, headless=False, offscreen=True):
     """启动 playwright 持久化上下文（复用 browser_data 登录态）。
 
@@ -253,6 +199,10 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=Non
         except (TypeError, ValueError):
             created_at = pub_date
         content = _plain_text(item.findtext("description") or "")
+        # 这一行**故意**不走 common.topic_row：RSS 拿不到浏览/回复/点赞/海报名/分类 ID，
+        # 于是它的形状就是「没测过指标的行」本身 —— 零指标 + 无 posters。若强行套上
+        # topic_row，这些零值会长得和「浏览器采到一条刚发的新帖」一模一样，日报就再也
+        # 分不出「没人看」和「没测过」。所以显式标 source/metrics_at，保留这个区别。
         topics.append({
             "id": tid, "title": (item.findtext("title") or "").strip()[:200],
             "url": link.removeprefix(BASE), "replies": 0, "views": 0,
@@ -262,7 +212,12 @@ def scrape_category_rss(cat, limit=0, proxy=None, retries=3, page=0, session=Non
             "pinned": (item.findtext(discourse + "topicPinned") or "").lower() == "yes",
             "archived": (item.findtext(discourse + "topicArchived") or "").lower() == "yes",
             "closed": (item.findtext(discourse + "topicClosed") or "").lower() == "yes",
-            "visible": True, "tags_raw": [], "_rss_content": content, "_rss_source": True,
+            "visible": True, "tags_raw": [],
+            "source": SOURCE_RSS,
+            # 空串 = 从未测过指标（不是「测于某时刻」）。merge 靠它决定要不要
+            # 让 RSS 覆盖已有浏览器数据。
+            "metrics_at": "",
+            "_rss_content": content,
         })
         if limit and len(topics) >= limit:
             break
@@ -392,36 +347,28 @@ def scrape_category(pg, cat, limit=0, page_delay=(1, 2), max_pages=40):
                     pu = user_map.get(posters[0].get("user_id")) or ""
                 author = pu
             # 保留 Discourse JSON 全部原始字段（额外信息：slug/点赞/回复帖数/原生标签/最后活跃者等）
-            raw_tags = [x for x in (t.get("tags") or []) if isinstance(x, str)]
             last_poster = ""
             if posters:
                 last_poster = posters[-1].get("username") or ""
                 if not last_poster and len(posters) > 1:
                     last_poster = user_map.get(posters[-1].get("user_id")) or ""
-            topics.append({
-                "id": tid,
-                "title": (t.get("title") or "")[:200],
-                "url": t.get("slug") and f"/t/{t.get('slug')}/{tid}" or f"/t/topic/{tid}",
-                "replies": int(t.get("reply_count") or 0),
-                "views": int(t.get("views") or 0),
-                "author": author,
-                "created_at": t.get("created_at") or "",
-                "bumped_at": t.get("bumped_at") or "",
-                # —— 以下为补充保留字段（用于防重/去重与数据丰富）——
-                "slug": t.get("slug") or "",
-                "like_count": int(t.get("like_count") or 0),
-                "posts_count": int(t.get("posts_count") or t.get("reply_count") or 0),
-                "posters": [user_map.get(p.get("user_id")) or p.get("username") or "" for p in posters],
-                "last_poster": last_poster,
-                "category_id": t.get("category_id") or "",
-                "pinned": bool(t.get("pinned")),
+            # 公共字段由 common.topic_row 统一产出（与 hot_topics 同一套口径），
+            # 这里只补 Discourse JSON 才有、热榜端拿不到的那几个。
+            row = topic_row(
+                t,
+                author=author,
+                posters=[user_map.get(p.get("user_id")) or p.get("username") or "" for p in posters],
+                last_poster=last_poster,
+                source=SOURCE_BROWSER,
+                metrics_at=RUN_COLLECTED_AT,
+            )
+            row.update({
                 "archived": bool(t.get("archived")),
                 "closed": bool(t.get("closed")),
-                "visible": bool(t.get("visible")),
-                "tags_raw": raw_tags,
                 "image_url": t.get("image_url") or "",
                 "thumbnails": t.get("thumbnails") or None,
             })
+            topics.append(row)
             fresh += 1
         log(f"  板块[{cat['n']}] 第{page_num}页: JSON 抓取 {len(topic_list)} 条，新增 {fresh} 条（累计 {len(topics)}）")
 
@@ -549,6 +496,12 @@ def scrape_category_dom(pg, cat, limit=0, page_delay=(2, 4)):
         for t in page_topics or []:
             if t["id"] not in seen:
                 seen.add(t["id"])
+                # DOM 行是**第三种来源**：有浏览/回复（列表页能看到），但没有点赞数、
+                # 海报名、原生标签，时间也只有 UTC+8 墙钟文本。必须在 Python 侧补来源
+                # —— 否则它既没有 posters 又不是 "Z" 结尾，会被 common.source_of 判成
+                # RSS，日报就会把一条明明测过的行当「没测过」。
+                t["source"] = SOURCE_DOM
+                t["metrics_at"] = RUN_COLLECTED_AT
                 topics.append(t)
                 fresh += 1
         log(f"  板块[{cat['n']}] 第{page_num}页: 抓取 {len(page_topics or [])} 条，新增 {fresh} 条（累计 {len(topics)}）")
@@ -620,6 +573,14 @@ def merge_incremental(all_rows):
 
     同 ID 记录不会整体覆盖：旧记录中未被新记录覆盖的字段（如历史标签、
     首次抓取时的原始字段）保留下来，避免重复抓取丢数据。
+
+    「新值优先」有一个例外，就是来源（provenance）：**观测不到某字段的来源，
+    不能拿它的默认值去盖**。RSS 行恒有 views=0 / like_count=0 / tags_raw=[]，
+    那是「没测」而不是「测出来是 0」。老写法用一个一次性布尔 `_rss_source`
+    挡这件事，但那个键一进缓存就被 pop 掉了 —— 于是「这行测过没有」只能靠
+    「指标是不是 0」反推，而浏览器采到一条刚发的新帖，指标**确实**就是 0
+    （实测缓存里有这么一行）。现在来源是行上的正式字段（common.SOURCE_*），
+    不可观测字段表在 common.UNOBSERVED_FIELDS，两处同源。
     返回 (新增, 全部)。
     """
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -635,7 +596,9 @@ def merge_incremental(all_rows):
     new_ids = set()
     for r in all_rows:
         r = dict(r)
-        rss_source = bool(r.pop("_rss_source", False))
+        # 本轮这条记录的来源。显式字段优先，老行按形状回推（common.source_of）。
+        new_source = r.get("source") or source_of(r)
+        unobserved = UNOBSERVED_FIELDS.get(new_source, frozenset())
         rid = r["id"]
         if rid not in old and rid not in new_ids:
             new_rows.append(r)
@@ -646,25 +609,34 @@ def merge_incremental(all_rows):
             continue
         # 已存在：字段级合并（新值优先，保留旧记录独有字段）
         old_r = old[rid]
+        old_source = source_of(old_r)
         merged_r = dict(old_r)
         for k, v in r.items():
-            if k == "id":
+            if k in ("id", "source", "metrics_at"):
+                # 来源两件套单独处理（见下面「来源只升不降」），不走通用覆盖。
                 continue
-            if rss_source and k in {"replies", "views", "like_count", "posts_count", "bumped_at", "slug"}:
-                # RSS 不提供这些完整指标，不用 0/发布时间覆盖旧 JSON 数据。
+            if k in unobserved:
+                # 本来源看不到这个字段 —— 别用它的默认值（0 / [] / 靠 pubDate
+                # 重算出来的时间）盖掉旧值。「信息量更低的观测不覆盖更高的观测」
+                # 是这里唯一的判据；判定表在 common.UNOBSERVED_FIELDS。
                 continue
             if k == "tags" and old_r.get("tags"):
                 # 标签并集：新老标签合并去重（老标签是人改过的，别丢）
                 merged_r[k] = list(dict.fromkeys(list(old_r["tags"]) + (v or [])))
             else:
                 merged_r[k] = v
+        if old_source != SOURCE_RSS and new_source == SOURCE_RSS:
+            # 来源只升不降：旧值是被**测过**的，本轮 RSS 什么指标都没测，
+            # 所以既不改来源、也不刷新观测时间 —— 刷新等于谎报「刚测过」。
+            merged_r["source"] = old_source
+        else:
+            merged_r["source"] = new_source
+            # 本轮的观测时刻。RSS 行显式写 ""（= 从未测过，不是「测于某时刻」）。
+            merged_r["metrics_at"] = r.get("metrics_at") or ""
         old[rid] = merged_r
 
     merged = list(old.values()) + new_rows
-    temporary = CACHE_FILE + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=1)
-    os.replace(temporary, CACHE_FILE)
+    write_json_atomic(CACHE_FILE, merged)
     return new_rows, merged
 
 
@@ -859,26 +831,16 @@ def main():
         # 可选：新帖抓正文（--content 开启，正文存 data/topic_content.json 并随行写飞书）
         if args.content and new_rows:
             try:
-                from fetch_content import fetch_content as _fc, load_json as _lj, save_json as _sj, CONTENT_FILE
-                contents = _lj(CONTENT_FILE, {})
-                got = 0
+                from fetch_content import fetch_batch, load_json, CONTENT_FILE
+                contents = load_json(CONTENT_FILE, {})
                 targets = new_rows[:args.content_limit] if args.content_limit else new_rows
                 if args.content_limit and len(new_rows) > len(targets):
                     warn(f"正文单轮上限 {args.content_limit}，本轮 {len(new_rows)} 条新帖中只抓前 {len(targets)} 条")
-                for row in targets:
-                    if args.rss and str(row.get("id")) in rss_contents:
-                        content = rss_contents[str(row.get("id"))]
-                        res = {"content": content, "author_raw": row.get("author", ""),
-                               "fetched_at": datetime.now().isoformat(timespec="seconds")}
-                    else:
-                        time.sleep(random.uniform(1, 2))
-                        res = _fc(pg, row)
-                    if res:
-                        contents[str(row.get("id"))] = res
-                        row["content"] = res.get("content", "")
-                        got += 1
-                _sj(CONTENT_FILE, contents)
-                log(f"新帖正文: 抓取 {got}/{len(targets)} 条 → {CONTENT_FILE}")
+                outcome = fetch_batch(pg, targets, contents, path=CONTENT_FILE,
+                                      supplied=rss_contents if args.rss else None)
+                log(f"新帖正文: 成功 {outcome['success']}/{len(targets)} 条 → {CONTENT_FILE}")
+                if outcome['failed']:
+                    warn(f"正文 {outcome['failed']} 条失败，可用 fetch_content.py 增量补全")
             except Exception as e:
                 # 不静默：列表数据仍算成功，但现场要能被 /status 看到。
                 warn(f"新帖正文抓取失败（列表已入库，正文缺失）: {e!r}")

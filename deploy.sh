@@ -6,7 +6,7 @@ cd "$LIVE"
 echo "== pre-deploy state =="
 git rev-parse HEAD | tee "$BK/head.txt"
 git status --porcelain=v1 | tee "$BK/status.txt"
-for f in README.md fetch_content.py linux_do_scraper.py push_to_feishu.py service.py tests/test_core.py daily_report.py hot_topics.py; do
+for f in README.md fetch_content.py linux_do_scraper.py push_to_feishu.py service.py tests/test_core.py daily_report.py hot_topics.py report_status.py common.py; do
   cp -p "$f" "$BK/$(basename "$f")"
 done
 cp -Rp reports "$BK/reports"

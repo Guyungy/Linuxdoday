@@ -17,7 +17,7 @@ fetch_content.py — 抓取 Linux.do 帖子正文（全量回填/增量补全）
 抓取策略：
   - 用 playwright 真实浏览器（复用 browser_data/ 登录态），浏览器内 fetch
     /t/<slug>/<id>.json 绕过 Cloudflare（DrissionPage 与 Chrome 153 不兼容已弃用）
-  - 每帖间隔 2-4s，避免被限流
+  - 两个入口共用批处理：每帖间隔 1–2s，失败最多重试一次，每 20 条存盘
 """
 
 import argparse
@@ -25,43 +25,16 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+from common import PROXY_DEFAULT, load_json, log, write_json_atomic
+
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
 CONTENT_FILE = os.path.join(DATA_DIR, "topic_content.json")
-USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
-
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
-
-
-def kill_stale_chrome(port=9222):
-    """清理残留 Chrome：既清固定 9222 端口，也清 browser_data profile 实例"""
-    import subprocess
-    patterns = [f"--remote-debugging-port={port}", "browser_data"]
-    killed = set()
-    for pat in patterns:
-        try:
-            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-            for pid in r.stdout.split():
-                pid = int(pid)
-                if pid in killed:
-                    continue
-                try:
-                    os.kill(pid, 15)
-                    killed.add(pid)
-                    log(f"已清理残留 Chrome 进程: {pid} ({pat})")
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
 
 def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
@@ -70,10 +43,7 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
     offscreen=True（默认）窗口在屏幕外，不弹窗不抢焦点（headless 会被 CF 拦）。
     """
     from browser_utils import start_browser as _start
-    ctx, page = _start(proxy=proxy, headless=headless, offscreen=offscreen)
-    # 兼容旧接口：返回 page；context 挂在 page 上由调用方 close
-    page._ctx = ctx
-    return page
+    return _start(proxy=proxy, headless=headless, offscreen=offscreen)
 
 
 def check_login(pg):
@@ -142,20 +112,50 @@ def fetch_content(pg, row):
     }
 
 
-def load_json(path, default):
+def has_content(entry):
+    """Only a nonempty text body counts as a completed cache entry."""
+    return (isinstance(entry, dict) and isinstance(entry.get('content'), str)
+            and bool(entry['content'].strip()))
+
+
+def fetch_batch(page, rows, contents, *, path=CONTENT_FILE, force=False,
+                supplied=None, delay=(1, 2), checkpoint=20):
+    """Fetch bounded batches; both entry points reuse cache and checkpoint progress.
+
+    Missing rows remain eligible for the standalone backfill command. On a browser
+    error, persist completed work and propagate it; never retry a closed context.
+    """
+    supplied = supplied or {}
+    success = failed = reused = 0
+    total = len(rows)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json(path, obj):
-    """原子写：先写临时文件再替换，避免与定时任务并发时读到半截 JSON。"""
-    temporary = f"{path}.tmp"
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(temporary, path)
+        for index, row in enumerate(rows, 1):
+            topic_id = str(row['id'])
+            result = None if force else contents.get(topic_id)
+            if has_content(result):
+                reused += 1
+            elif topic_id in supplied:
+                result = {'content': supplied[topic_id],
+                          'author_raw': row.get('author', ''),
+                          'fetched_at': datetime.now().isoformat(timespec='seconds')}
+            else:
+                for attempt in range(2):
+                    time.sleep(random.uniform(*delay) if attempt == 0 else 8)
+                    result = fetch_content(page, row)
+                    if result:
+                        break
+            if has_content(result):
+                contents[topic_id] = result
+                row['content'] = result['content']
+                success += 1
+            else:
+                failed += 1
+            if index % checkpoint == 0 or index == total:
+                write_json_atomic(path, contents)
+                log(f'正文进度 {index}/{total}，成功 {success}，失败 {failed}，缓存复用 {reused}')
+    finally:
+        write_json_atomic(path, contents)
+    return {'success': success, 'failed': failed, 'reused': reused}
 
 
 def main():
@@ -176,15 +176,18 @@ def main():
     if args.all:
         todo = rows
     else:
-        todo = [r for r in rows if str(r.get("id")) not in contents]
+        todo = [r for r in rows if not has_content(contents.get(str(r.get("id"))))]
 
     if args.recent_days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.recent_days)
         def _created(row):
             try:
-                return datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00"))
             except ValueError:
                 return None
+            # 无时区的 created_at 会变成 naive datetime，与 aware 的 cutoff 比较会崩。
+            # 缓存里存在这类历史行（DOM 回退路径产出），必须补 tzinfo 后再比。
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         todo = [r for r in todo if (_created(r) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
         todo.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)  # 新的优先
 
@@ -198,37 +201,20 @@ def main():
         log("没有需要抓取的帖子")
         return
 
-    kill_stale_chrome()
-    pg = start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT, headless=args.headless,
-                       offscreen=not getattr(args, "show_browser", False))
-    if not check_login(pg):
-        # Linux.do 公开社区：未登录也能抓正文（playwright 真实浏览器已过 CF）。仅提示不阻断。
-        log("⚠️ 未检测到登录态（公开数据仍可抓，如需登录请先运行 --browse）")
-    log("浏览器就绪")
-
-    ok = fail = 0
-    for i, row in enumerate(todo):
-        tid = str(row.get("id"))
-        if args.limit and i >= args.limit:
-            break
-        time.sleep(random.uniform(2, 4))
-        res = fetch_content(pg, row)
-        if res:
-            contents[tid] = res
-            ok += 1
-            if ok % 20 == 0:
-                save_json(CONTENT_FILE, contents)
-                log(f"  进度 {i+1}/{len(todo)}，成功 {ok}，失败 {fail}（已存盘）")
-        else:
-            fail += 1
-        # 每 50 条存一次盘，防中断丢失
-        if (i + 1) % 50 == 0:
-            save_json(CONTENT_FILE, contents)
-
-    save_json(CONTENT_FILE, contents)
-    log(f"完成：成功 {ok}，失败 {fail}，正文总数 {len(contents)} → {CONTENT_FILE}")
-    pg._ctx.close()
+    ctx, pg = start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT,
+                            headless=args.headless, offscreen=not args.show_browser)
+    try:
+        contents = load_json(CONTENT_FILE, {})
+        if not check_login(pg):
+            log('⚠️ 未检测到登录态（公开数据仍可抓，如需登录请先运行 --browse）')
+        targets = todo[:args.limit] if args.limit else todo
+        result = fetch_batch(pg, targets, contents, path=CONTENT_FILE, force=args.all)
+        log(f"完成：成功 {result['success']}，失败 {result['failed']}，正文总数 {len(contents)}")
+        if result['failed']:
+            raise SystemExit(1)
+    finally:
+        ctx.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

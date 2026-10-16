@@ -30,6 +30,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import report_status
+from common import WARN_PREFIX, extract_warnings, write_json_atomic
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -40,13 +43,16 @@ PUSH_RESULT_FILE = DATA_DIR / ".push_result.json"
 HOT_FILE = DATA_DIR / "hot_topics.json"
 
 # 抓取子进程用这个前缀标记「降级但没失败」的现场（热榜/正文抓取失败等）。
-# 见 linux_do_scraper.py 的 WARN_PREFIX，两处必须一致。
-WARN_PREFIX = "WARN: "
+# WARN_PREFIX / extract_warnings 都从 common import —— 与 linux_do_scraper.py
+# 共用同一份定义，不再各写一遍字面量。
 # /status 里保留的 stderr 尾部长度：够定位，不至于把状态接口撑大。
 MAX_STDERR_KEPT = 2000
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # 连续失败时每 N 轮向 stderr 重播一次：既不刷屏，也不至于让长期故障彻底没人看见。
 FAILURE_REANNOUNCE_EVERY = 4
+# 同一天内重试日报的最小间隔（秒）。6 小时抓取节奏下这条永远不生效；它防的是
+# SCRAPE_INTERVAL_SECONDS 被调成分钟级时，凭据长期坏掉还要每轮都去打一次模型接口。
+REPORT_RETRY_MIN_INTERVAL = 1800
 
 # 每轮子进程 stderr 的**完整**留档（POLL-78 追加交付物）。
 # /status 里的 last_error / last_stderr 都是 tail() 出来的（4000 / 2000），长轮次
@@ -140,19 +146,6 @@ def run_with_wall_clock_deadline(command, timeout, *, env=None, input_text=None,
     return outcome["result"]
 
 
-def extract_warnings(stderr):
-    """从子进程 stderr 里捞出 WARN: 行 —— 成功轮次里唯一能带出降级现场的通道。"""
-    found = []
-    for line in (stderr or "").splitlines():
-        marker = line.find(WARN_PREFIX)
-        if marker == -1:
-            continue
-        message = line[marker + len(WARN_PREFIX):].strip()
-        if message:
-            found.append(message)
-    return found
-
-
 def resolve_host():
     """监听地址：默认回环。
 
@@ -164,10 +157,9 @@ def resolve_host():
 
 
 def atomic_write_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    """原子写 JSON。实现收在 common 里；这里保留函数名与本服务的 indent=2 口径
+    （service 写的是给人看的 state 文件，2 空格比 1 空格好读，且既有文件就是这个格式）。"""
+    write_json_atomic(path, value, indent=2)
 
 
 def env_bool(name, default=False):
@@ -210,6 +202,8 @@ class ScrapeService:
         # 去重签名：不能在 state["last_error"] 上做判断 —— run_once 每次开头都会把它
         # 清成 None（「正在跑」期间不该挂着上一轮的错），那会让去重永远失效。
         self._last_failure_message = None
+        # 上次尝试生成日报的墙钟时刻：should_report_today 的重试节流用。
+        self._report_last_attempt = 0.0
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
@@ -266,6 +260,9 @@ class ScrapeService:
             "daily_report_enabled": self.daily_report,
             "daily_report_hour": self.report_hour,
             "daily_report_chat": self.report_chat or None,
+            # 今天日报的状态（disabled/missing/ok/degraded/unmarked）：
+            # 「服务全绿、日报却连坏 14 天」这个故障形态靠它露出来。
+            "daily_report_status": self.daily_report_status(),
             "feishu_push_enabled": self.push_to_feishu,
             "manual_run_enabled": bool(self.token),
             "read_auth_enabled": self.protect_reads,
@@ -470,13 +467,42 @@ class ScrapeService:
             self.lock.release()
 
     def should_report_today(self):
-        """每天只出一份日报：过了 report_hour 且当天文件还不存在。"""
+        """该不该出今天的日报？
+
+        旧版只问「当天文件在不在」，于是模型调用失败写出的那份占位报告也被当成
+        「今天已完成」—— 服务照旧全绿，报告里连写 14 天「模型调用失败」没人发现。
+
+        现在问的是「今天有没有一份**确认成功**的报告」：文件不存在、或首行状态标记
+        不是 ok（降级 / 旧格式无标记），都算没有，当天可以重试。重试之间加一道最小
+        间隔，免得抓取节奏被调密后每轮都去打一次已经坏掉的模型接口。
+        """
         if not self.daily_report:
             return False
         now = datetime.now()
         if now.hour < self.report_hour:
             return False
-        return not (REPORT_DIR / f"AI日报-{now.date()}.md").exists()
+        if time.time() - self._report_last_attempt < REPORT_RETRY_MIN_INTERVAL:
+            return False
+        return report_status.is_degraded(
+            report_status.read_head(REPORT_DIR / f"AI日报-{now.date()}.md"))
+
+    def daily_report_status(self):
+        """今天日报的状态，给 /status 与 /health 看。
+
+        disabled  未开启日报
+        missing   今天还没生成
+        ok        已生成，且模型分析正常产出
+        degraded  已生成，但只是占位版（模型调用失败 / 无凭据）
+        unmarked  文件在，但没有状态标记 —— 早于本契约的旧文件，同样不算成功
+        """
+        if not self.daily_report:
+            return "disabled"
+        day = datetime.now().date()
+        head = report_status.read_head(REPORT_DIR / f"AI日报-{day}.md")
+        found = report_status.read_status(head)
+        if found is not None:
+            return found[0]
+        return "unmarked" if head else "missing"
 
     def daily_report_command(self):
         command = [sys.executable, str(ROOT / "daily_report.py")]
@@ -498,9 +524,16 @@ class ScrapeService:
 
     def run_daily_report(self):
         """生成日报；失败只记现场，不影响抓取主流程，更不允许打死调度线程。"""
+        self._report_last_attempt = time.time()
         try:
             result = run_with_wall_clock_deadline(
                 self.daily_report_command(), self.timeout, env=os.environ.copy())
+            if result.returncode == report_status.EXIT_DEGRADED:
+                # 降级：文件写出来了，但内容是占位版（模型调用失败 / 无凭据）。
+                # 关键是**不把它记成成功** —— 那正是日报连坏 14 天没人发现的成因。
+                self._record_report_error(
+                    f"日报降级（非成功产物，将重试）: {tail(result.stderr or result.stdout, 500)}")
+                return False
             if result.returncode != 0:
                 self._record_report_error(f"日报生成失败: {tail(result.stderr or result.stdout, 500)}")
                 return False
@@ -657,6 +690,9 @@ class Handler(BaseHTTPRequestHandler):
                 "scheduler_alive": alive,
                 "last_tick_at": state["last_tick_at"],
                 "consecutive_failures": state["consecutive_failures"],
+                # 新增字段，不动 ok 的语义（容器探针只认 ok）：日报坏掉时 ok 仍是 true，
+                # 但这一项会明说 degraded —— 否则「全绿而日报不出」还是看不见。
+                "daily_report": state["daily_report_status"],
             })
         elif path == "/ready":
             state = SERVICE.snapshot()

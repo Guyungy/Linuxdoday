@@ -16,7 +16,8 @@ headless=False 下可正常通过 Cloudflare Turnstile 托管挑战。
 """
 
 import os
-import subprocess
+import atexit
+import fcntl
 import sys
 import time
 from datetime import datetime
@@ -24,41 +25,49 @@ from typing import NamedTuple
 
 from playwright.sync_api import sync_playwright
 
+from common import PROXY_DEFAULT, log
+
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
 
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+class BrowserSession:
+    """Own the context, Playwright driver and exclusive profile lease together."""
+
+    def __init__(self, context, driver, lease):
+        self.context = context
+        self.driver = driver
+        self.lease = lease
+        self.closed = False
+        atexit.register(self.close)
+
+    def __getattr__(self, name):
+        return getattr(self.context, name)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        atexit.unregister(self.close)
+        try:
+            self.context.close()
+        finally:
+            try:
+                self.driver.stop()
+            finally:
+                self.lease.close()
 
 
-def kill_stale_chrome():
-    """清理残留 Chrome：以 browser_data 为 user-data-dir 的实例会锁住 profile，
-    导致 launch_persistent_context 无法复用登录态。只杀本项目自己的实例。"""
+def acquire_profile_lease():
+    """Fail fast rather than terminating another job using this profile."""
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    lease = open(os.path.join(USER_DATA_DIR, '.scraper.lock'), 'a+')
     try:
-        out = subprocess.run(
-            ["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5,
-        ).stdout
-        pids = []
-        for line in out.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) != 2:
-                continue
-            pid, command = parts
-            if ("Google Chrome.app/Contents/MacOS/Google Chrome" in command
-                    and f"--user-data-dir={USER_DATA_DIR}" in command):
-                pids.append(int(pid))
-        if pids:
-            for pid in pids:
-                try:
-                    os.kill(pid, 15)
-                except ProcessLookupError:
-                    pass
-            log(f"已清理项目 Chrome 进程: {', '.join(map(str, pids))}")
-            time.sleep(2)
-    except Exception:
-        pass
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lease.close()
+        raise RuntimeError('项目浏览器正在被其他抓取任务使用，请稍后重试') from None
+    return lease
 
 
 def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
@@ -69,8 +78,12 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
     offscreen=True（默认）：窗口开到屏幕外，不抢焦点、不遮挡桌面，但仍是
       有头真实浏览器 —— 实测可正常通过 Cloudflare（headless 则 403）。
     """
-    kill_stale_chrome()
-    p = sync_playwright().start()
+    lease = acquire_profile_lease()
+    try:
+        p = sync_playwright().start()
+    except BaseException:
+        lease.close()
+        raise
     args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-background-timer-throttling",
@@ -80,30 +93,45 @@ def start_browser(proxy=PROXY_DEFAULT, headless=False, offscreen=True):
     if offscreen and not headless:
         # 移到可视区域之外；窗口仍存在，只是用户看不见
         args += ["--window-position=-2400,-2400", "--window-size=1280,900"]
-    ctx = p.chromium.launch_persistent_context(
-        user_data_dir=USER_DATA_DIR,
-        channel="chrome",          # 用系统已装的 Google Chrome（非 bundled chromium）
-        headless=headless,
-        proxy={"server": f"http://{proxy}"} if proxy else None,
-        args=args,
-        viewport={"width": 1920, "height": 1080},
-    )
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    if offscreen and not headless:
-        # macOS 不一定遵守 --window-position；最小化专用窗口，避免遮挡桌面。
-        session = None
+    try:
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
+            channel="chrome",          # 用系统已装的 Google Chrome（非 bundled chromium）
+            headless=headless,
+            proxy={"server": f"http://{proxy}"} if proxy else None,
+            args=args,
+            viewport={"width": 1920, "height": 1080},
+        )
+    except BaseException:
         try:
-            session = ctx.new_cdp_session(page)
-            window = session.send("Browser.getWindowForTarget")
-            session.send("Browser.setWindowBounds", {
-                "windowId": window["windowId"], "bounds": {"windowState": "minimized"},
-            })
-        except Exception as exc:
-            log(f"窗口最小化未成功（继续离屏运行）: {type(exc).__name__}")
+            p.stop()
         finally:
-            if session:
-                session.detach()
-    return ctx, page
+            lease.close()
+        raise
+    ctx = BrowserSession(ctx, p, lease)
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if offscreen and not headless:
+            # macOS 不一定遵守 --window-position；最小化专用窗口，避免遮挡桌面。
+            session = None
+            try:
+                session = ctx.new_cdp_session(page)
+                window = session.send("Browser.getWindowForTarget")
+                session.send("Browser.setWindowBounds", {
+                    "windowId": window["windowId"], "bounds": {"windowState": "minimized"},
+                })
+            except Exception as exc:
+                log(f"窗口最小化未成功（继续离屏运行）: {type(exc).__name__}")
+            finally:
+                if session:
+                    try:
+                        session.detach()
+                    except Exception as exc:
+                        log(f"窗口控制会话释放失败: {type(exc).__name__}")
+        return ctx, page
+    except BaseException:
+        ctx.close()
+        raise
 
 
 def wait_json_ready(page, slug="develop/4", timeout=90, interval=3):
@@ -352,25 +380,3 @@ def wait_cf_challenge(page, url, timeout=60, interval=2):
     log(f"⚠️ Cloudflare 判据未确认通过（{timeout}s）: {last.describe()}")
     return last
 
-    while True:
-        probe, error = _probe_page(page)
-        if probe is None:
-            last = CfChallengeOutcome(CF_UNCONFIRMED, f"页面探测失败: {error}", last.title, url)
-        else:
-            title = probe.get("title") or ""
-            landed = probe.get("url") or url
-            if probe.get("challenge") or _title_is_challenge(title):
-                last = CfChallengeOutcome(CF_CHALLENGE, "仍在 Cloudflare 挑战页", title, landed)
-            elif not title.strip():
-                last = CfChallengeOutcome(CF_UNCONFIRMED, "页面 title 为空，无法确认已离开挑战页", title, landed)
-            elif probe.get("ready"):
-                return CfChallengeOutcome(CF_PASSED, "已确认通过", title, landed)
-            else:
-                last = CfChallengeOutcome(CF_UNCONFIRMED, "已离开挑战页，但不是目标站点页面", title, landed)
-
-        if time.time() >= deadline:
-            break
-        time.sleep(interval)
-
-    log(f"⚠️ Cloudflare 判据未确认通过（{timeout}s）: {last.describe()}")
-    return last

@@ -35,8 +35,11 @@ RUN pip install --no-cache-dir -r requirements-service.txt \
 #   daily_report.py       AI 日报（DAILY_REPORT=true 时）
 #   hot_topics.py         官方热榜（browser 模式下 SCRAPE_HOT 默认 true）
 #   browser_utils.py      browser 模式的 playwright 入口
+#   report_status.py      service.py 与 daily_report.py 共用的日报状态契约（import 进来，非 shell out）
+#   common.py             全流水线共用的底层零件（时间归一化/原子写/WARN 协议/帖子行）
 COPY --chown=linuxdoday:linuxdoday service.py linux_do_scraper.py fetch_content.py \
-     push_to_feishu.py daily_report.py hot_topics.py browser_utils.py ./
+     push_to_feishu.py daily_report.py hot_topics.py browser_utils.py report_status.py \
+     common.py ./
 
 USER linuxdoday
 EXPOSE 8080

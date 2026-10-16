@@ -20,10 +20,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import common
 import hot_topics
 import linux_do_scraper as scraper
 import push_to_feishu as feishu
 import daily_report as report
+import report_status
 import service
 
 
@@ -127,13 +129,200 @@ class ScraperTests(unittest.TestCase):
             }]), encoding="utf-8")
             incoming = [{
                 "id": "1", "title": "new", "views": 0, "replies": 0,
-                "tags": ["auto"], "_rss_source": True,
+                "tags": ["auto"], "source": "rss", "metrics_at": "",
             }]
             with patch.object(scraper, "CACHE_FILE", str(cache)), patch.object(scraper, "DATA_DIR", directory):
                 new_rows, merged = scraper.merge_incremental(incoming)
             self.assertEqual([], new_rows)
             self.assertEqual(99, merged[0]["views"])
+            self.assertEqual(8, merged[0]["replies"])
             self.assertEqual(["manual", "auto"], merged[0]["tags"])
+            # 来源只升不降：旧行是被测过的，本轮 RSS 没测任何东西，不能把来源降级。
+            self.assertEqual(common.SOURCE_BROWSER, merged[0]["source"])
+
+
+class ProvenanceTests(unittest.TestCase):
+    """来源（provenance）契约：行上记来源，merge 按来源决定哪些字段不可信。
+
+    这套东西的存在理由，是缓存里 13,960 条 RSS 行的 👁0 💬0 被日报当成
+    「热度低」，排进「长尾(<100)」并宣称是「按浏览量+回复加权排序的 Top N」。
+    那些 0 是**没测**，不是「没人看」。
+    """
+
+    def merge(self, old_rows, incoming):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "topics.json"
+            cache.write_text(json.dumps(old_rows), encoding="utf-8")
+            with patch.object(scraper, "CACHE_FILE", str(cache)), patch.object(scraper, "DATA_DIR", directory):
+                return scraper.merge_incremental(incoming)[1]
+
+    # --- now_iso ---------------------------------------------------------
+    def test_now_iso_is_utc_with_z_suffix(self):
+        text = common.now_iso()
+        self.assertTrue(text.endswith("Z"), text)
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+        self.assertLess(abs((datetime.utcnow() - parsed).total_seconds()), 60)
+
+    # --- source_of -------------------------------------------------------
+    def test_source_of_prefers_explicit_field(self):
+        # 哪怕形状像 RSS（全零指标、无 posters），显式来源说了算 ——
+        # 这正是「指标为 0 ≠ 没测过」那条缝要用字段堵住的原因。
+        row = {"id": "1", "views": 0, "replies": 0, "like_count": 0, "source": common.SOURCE_BROWSER}
+        self.assertEqual(common.SOURCE_BROWSER, common.source_of(row))
+        self.assertTrue(common.is_measured(row))
+
+    def test_source_of_ignores_unknown_explicit_value(self):
+        row = {"id": "1", "views": 5, "source": "telepathy"}
+        self.assertEqual(common.SOURCE_BROWSER, common.source_of(row))
+
+    def test_source_of_infers_browser_from_metrics(self):
+        self.assertEqual(common.SOURCE_BROWSER, common.source_of({"id": "1", "views": 7}))
+
+    def test_source_of_infers_browser_from_posters(self):
+        self.assertEqual(common.SOURCE_BROWSER, common.source_of({"id": "1", "posters": []}))
+
+    def test_source_of_infers_browser_from_z_suffixed_created_at(self):
+        row = {"id": "1", "created_at": "2026-10-01T00:00:00.000Z"}
+        self.assertEqual(common.SOURCE_BROWSER, common.source_of(row))
+
+    def test_source_of_infers_rss_from_rss_shape(self):
+        # RSS 行：零指标、无 posters、pubDate 走 isoformat 得到 "+00:00"。
+        row = {"id": "1", "views": 0, "replies": 0, "like_count": 0,
+               "created_at": "2026-10-01T00:00:00+00:00"}
+        self.assertEqual(common.SOURCE_RSS, common.source_of(row))
+        self.assertFalse(common.is_measured(row))
+
+    def test_zero_metric_fresh_browser_post_is_indistinguishable_without_source(self):
+        # 实测缓存里真有这么一行（id 2984019，刚发的新帖）：指标确实全是 0。
+        # 光看形状会判成 RSS —— 所以形状回推只是老数据的兜底，新数据必须带 source。
+        fresh = {"id": "2984019", "views": 0, "replies": 0, "like_count": 0}
+        self.assertEqual(common.SOURCE_RSS, common.source_of(fresh))
+        fresh["source"] = common.SOURCE_BROWSER
+        self.assertTrue(common.is_measured(fresh))
+
+    # --- UNOBSERVED_FIELDS ----------------------------------------------
+    def test_rss_unobserved_fields_cover_the_known_data_losses(self):
+        rss = common.UNOBSERVED_FIELDS[common.SOURCE_RSS]
+        # 指标 + 由 pubDate 重算、格式与精度都比 JSON 差的时间；
+        # tags_raw 是空的、slug 是空的 —— 都是「没观测到」而非「观测到是空」。
+        for key in ("views", "replies", "like_count", "posts_count",
+                    "bumped_at", "slug", "tags_raw", "created_at"):
+            self.assertIn(key, rss)
+        # tags（人改过的自动标签）不在表里：RSS 轮次不参与标签合并，本就不该跳过。
+        self.assertNotIn("tags", rss)
+
+    def test_hot_source_has_no_guard_entry_yet(self):
+        # 没读到过 hot 行的实际形状，就不编一张表出来 —— 空集合即「不跳过任何字段」。
+        self.assertNotIn(common.SOURCE_HOT, common.UNOBSERVED_FIELDS)
+
+    # --- topic_row -------------------------------------------------------
+    def test_topic_row_omits_provenance_keys_when_not_given(self):
+        row = common.topic_row({"id": 1, "title": "t"})
+        self.assertNotIn("source", row)
+        self.assertNotIn("metrics_at", row)
+
+    def test_topic_row_carries_provenance_when_given(self):
+        row = common.topic_row({"id": 1, "title": "t"},
+                               source=common.SOURCE_BROWSER, metrics_at="2026-10-16T00:00:00Z")
+        self.assertEqual(common.SOURCE_BROWSER, row["source"])
+        self.assertEqual("2026-10-16T00:00:00Z", row["metrics_at"])
+
+    # --- merge_incremental ----------------------------------------------
+    def test_merge_rss_does_not_clobber_tags_raw(self):
+        # 同种丢数据：RSS 行的 tags_raw 恒为 []，会把浏览器采到的原生标签抹掉。
+        merged = self.merge(
+            [{"id": "1", "views": 99, "tags_raw": ["快讯", "教程"], "tags": ["auto"]}],
+            [{"id": "1", "views": 0, "tags_raw": [], "source": common.SOURCE_RSS, "metrics_at": ""}],
+        )
+        self.assertEqual(["快讯", "教程"], merged[0]["tags_raw"])
+
+    def test_merge_rss_does_not_clobber_created_at(self):
+        # 实测 226 行中招：RSS 的 pubDate 解析不出来时 created_at 就是空串，
+        # 直接把创建时间抹成空。
+        merged = self.merge(
+            [{"id": "1", "views": 99, "created_at": "2026-09-01T00:00:00.000Z"}],
+            [{"id": "1", "views": 0, "created_at": "", "bumped_at": "",
+              "source": common.SOURCE_RSS, "metrics_at": ""}],
+        )
+        self.assertEqual("2026-09-01T00:00:00.000Z", merged[0]["created_at"])
+
+    def test_merge_rss_still_updates_fields_it_does_observe(self):
+        # 反过来也要成立：RSS 能看到的字段（标题、作者）照常取新值，
+        # 别把守卫写成「RSS 一轮什么都不更新」。
+        merged = self.merge(
+            [{"id": "1", "title": "old", "author": "a", "views": 99}],
+            [{"id": "1", "title": "new", "author": "b", "views": 0,
+              "source": common.SOURCE_RSS, "metrics_at": ""}],
+        )
+        self.assertEqual("new", merged[0]["title"])
+        self.assertEqual("b", merged[0]["author"])
+        self.assertEqual(99, merged[0]["views"])
+
+    def test_merge_promotes_rss_row_when_browser_measures_it(self):
+        merged = self.merge(
+            [{"id": "1", "views": 0, "source": common.SOURCE_RSS, "metrics_at": ""}],
+            [{"id": "1", "views": 42, "source": common.SOURCE_BROWSER,
+              "metrics_at": "2026-10-16T03:00:00Z"}],
+        )
+        self.assertEqual(42, merged[0]["views"])
+        self.assertEqual(common.SOURCE_BROWSER, merged[0]["source"])
+        self.assertEqual("2026-10-16T03:00:00Z", merged[0]["metrics_at"])
+
+    def test_merge_keeps_old_metrics_at_when_rss_does_not_remeasure(self):
+        # metrics_at 是「这批指标什么时候看的」。RSS 轮次没看指标，
+        # 刷新它就等于谎报「刚测过」。
+        merged = self.merge(
+            [{"id": "1", "views": 99, "source": common.SOURCE_BROWSER,
+              "metrics_at": "2026-10-01T00:00:00Z"}],
+            [{"id": "1", "views": 0, "source": common.SOURCE_RSS, "metrics_at": ""}],
+        )
+        self.assertEqual("2026-10-01T00:00:00Z", merged[0]["metrics_at"])
+        self.assertEqual(common.SOURCE_BROWSER, merged[0]["source"])
+
+    def test_merge_refreshes_metrics_at_on_a_new_browser_round(self):
+        merged = self.merge(
+            [{"id": "1", "views": 99, "source": common.SOURCE_BROWSER,
+              "metrics_at": "2026-10-01T00:00:00Z"}],
+            [{"id": "1", "views": 120, "source": common.SOURCE_BROWSER,
+              "metrics_at": "2026-10-16T03:00:00Z"}],
+        )
+        self.assertEqual(120, merged[0]["views"])
+        self.assertEqual("2026-10-16T03:00:00Z", merged[0]["metrics_at"])
+
+    def test_merge_backfills_source_on_untouched_legacy_rows(self):
+        # 老行没有 source。合并一轮后至少这行有了显式来源 ——
+        # 全量回填由迁移脚本负责，但「被合并到的行」当场就补上。
+        merged = self.merge(
+            [{"id": "1", "views": 99}],
+            [{"id": "1", "views": 120, "source": common.SOURCE_BROWSER,
+              "metrics_at": "2026-10-16T03:00:00Z"}],
+        )
+        self.assertEqual(common.SOURCE_BROWSER, merged[0]["source"])
+
+    def test_merge_keeps_fresh_browser_row_labelled_after_an_rss_round(self):
+        # 最刁的一条：浏览器采到一条刚发的新帖（真·零指标），随后 RSS 轮次
+        # 也采到它。若靠「指标是不是 0」判来源，这一行会在这轮被降级成 RSS，
+        # 从此日报把它当「没测过」—— 而它其实测过。
+        merged = self.merge(
+            [{"id": "2984019", "views": 0, "replies": 0, "like_count": 0,
+              "source": common.SOURCE_BROWSER, "metrics_at": "2026-10-16T02:00:00Z"}],
+            [{"id": "2984019", "views": 0, "replies": 0, "like_count": 0,
+              "source": common.SOURCE_RSS, "metrics_at": ""}],
+        )
+        self.assertEqual(common.SOURCE_BROWSER, merged[0]["source"])
+        self.assertTrue(common.is_measured(merged[0]))
+
+    def test_merge_dom_row_keeps_like_count_but_takes_views(self):
+        # DOM 看不到点赞数（列表页没有），但看得到浏览/回复。
+        merged = self.merge(
+            [{"id": "1", "views": 10, "like_count": 7,
+              "source": common.SOURCE_BROWSER, "metrics_at": "2026-10-01T00:00:00Z"}],
+            [{"id": "1", "views": 33, "like_count": 0,
+              "source": common.SOURCE_DOM, "metrics_at": "2026-10-16T03:00:00Z"}],
+        )
+        self.assertEqual(33, merged[0]["views"])
+        self.assertEqual(7, merged[0]["like_count"])
+        self.assertEqual(common.SOURCE_DOM, merged[0]["source"])
 
 
 class PersistenceTests(unittest.TestCase):
@@ -285,13 +474,60 @@ class ServiceModeTests(unittest.TestCase):
             fake.now.return_value = datetime(2026, 9, 29, 9, 0, 0)
             self.assertFalse(svc.should_report_today())
 
-    def test_daily_report_skipped_when_file_exists(self):
+    def test_daily_report_skipped_when_todays_report_is_confirmed_ok(self):
+        with tempfile.TemporaryDirectory() as directory:
+            svc = self.build(DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+            report_dir = Path(directory)
+            (report_dir / f"AI日报-{date.today()}.md").write_text(
+                report_status.marker(report_status.OK) + "\n# 今天的日报\n", encoding="utf-8")
+            with patch.object(service, "REPORT_DIR", report_dir):
+                self.assertFalse(svc.should_report_today())
+
+    def test_daily_report_retried_when_todays_report_is_degraded(self):
+        """降级产物不算「今天已完成」—— 这正是日报连坏 14 天没人发现的洞。"""
+        with tempfile.TemporaryDirectory() as directory:
+            svc = self.build(DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+            report_dir = Path(directory)
+            (report_dir / f"AI日报-{date.today()}.md").write_text(
+                report_status.marker(report_status.DEGRADED, "llm_failed") + "\n# 占位\n",
+                encoding="utf-8")
+            with patch.object(service, "REPORT_DIR", report_dir):
+                self.assertTrue(svc.should_report_today())
+                self.assertEqual("degraded", svc.daily_report_status())
+
+    def test_daily_report_retried_when_todays_file_has_no_marker(self):
+        """旧格式文件（没有状态标记）同样不算成功：读不出来就不许当成功。"""
         with tempfile.TemporaryDirectory() as directory:
             svc = self.build(DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
             report_dir = Path(directory)
             (report_dir / f"AI日报-{date.today()}.md").write_text("x", encoding="utf-8")
             with patch.object(service, "REPORT_DIR", report_dir):
+                self.assertTrue(svc.should_report_today())
+                self.assertEqual("unmarked", svc.daily_report_status())
+
+    def test_daily_report_retry_is_throttled(self):
+        """抓取节奏被调密时，坏掉的模型接口不该每轮被打一次。"""
+        with tempfile.TemporaryDirectory() as directory:
+            svc = self.build(DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+            report_dir = Path(directory)
+            (report_dir / f"AI日报-{date.today()}.md").write_text(
+                report_status.marker(report_status.DEGRADED, "llm_failed"), encoding="utf-8")
+            with patch.object(service, "REPORT_DIR", report_dir), \
+                 patch.object(service, "REPORT_RETRY_MIN_INTERVAL", 1800):
+                self.assertTrue(svc.should_report_today())
+                svc._report_last_attempt = time.time()   # 刚试过一次
                 self.assertFalse(svc.should_report_today())
+                svc._report_last_attempt = time.time() - 1801
+                self.assertTrue(svc.should_report_today())
+
+    def test_daily_report_status_reports_missing_and_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            svc = self.build(DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+            with patch.object(service, "REPORT_DIR", Path(directory)):
+                self.assertEqual("missing", svc.daily_report_status())
+            self.assertEqual("disabled", self.build(SCRAPE_MODE="browser").daily_report_status())
+            self.assertEqual("disabled",
+                             self.build(SCRAPE_MODE="browser").snapshot()["daily_report_status"])
 
     def test_unknown_mode_falls_back_to_rss(self):
         self.assertEqual("rss", self.build(SCRAPE_MODE="nope").mode)
@@ -792,6 +1028,36 @@ class SchedulerResilienceTests(unittest.TestCase):
         self.assertIsNotNone(snapshot["last_success_at"])
         self.assertIn("daily_report.py", snapshot["last_error"])
 
+    def test_degraded_daily_report_is_recorded_as_failure(self):
+        """日报降级（退出码 3）必须记成失败：旧版把它记成成功，当天就不再重试。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "reports").mkdir()
+            svc = self.build(SCRAPE_MODE="rss", DAILY_REPORT="true", DAILY_REPORT_HOUR="0")
+
+            def fake_run(command, timeout, **kwargs):
+                if str(command[1]).endswith("daily_report.py"):
+                    return SimpleNamespace(returncode=3, stdout="",
+                                           stderr="⚠️ 日报降级（llm_failed），不推送飞书")
+                return SimpleNamespace(returncode=0, stdout=json.dumps([{"Topic ID": "1"}]), stderr="")
+
+            with patch.object(service, "LATEST_FILE", root / "latest_run.json"), \
+                 patch.object(service, "STDERR_LOG_FILE", root / "scrape_stderr.log"), \
+                 patch.object(service, "DATA_DIR", root), \
+                 patch.object(service, "REPORT_DIR", root / "reports"), \
+                 patch.object(service, "run_with_wall_clock_deadline", side_effect=fake_run):
+                ok, _ = svc.run_once("schedule")
+                svc._report_last_attempt = 0.0     # 排除重试节流，只看「降级算不算成功」
+                retry = svc.should_report_today()
+                status = svc.daily_report_status()
+
+            snapshot = svc.snapshot()
+
+        self.assertTrue(ok)                                    # 抓取本身成功
+        self.assertEqual("missing", status)                    # 降级产物未被写出来
+        self.assertTrue(retry)                                 # 所以当天还会重试
+        self.assertIn("日报降级", snapshot["last_error"])
+
     def test_scheduler_survives_repeated_run_once_exceptions(self):
         svc = self.build(SCRAPE_MODE="rss")
         rounds = []
@@ -1140,6 +1406,125 @@ class DeploymentDefaultsTests(unittest.TestCase):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertRegex(readme, r"\|\s*`SERVICE_HOST`\s*\|\s*`127\.0\.0\.1`\s*\|")
         self.assertRegex(readme, r"\|\s*`PROTECT_READ_ENDPOINTS`\s*\|\s*`false`\s*\|")
+
+
+class ReportStatusContractTests(unittest.TestCase):
+    """状态标记是 service.py 与 daily_report.py 之间唯一的「成功」凭据。"""
+
+    def test_marker_round_trips(self):
+        self.assertEqual((report_status.OK, ""),
+                         report_status.read_status(report_status.marker(report_status.OK)))
+        self.assertEqual((report_status.DEGRADED, "llm_failed"),
+                         report_status.read_status(
+                             report_status.marker(report_status.DEGRADED, "llm_failed")))
+
+    def test_unreadable_marker_is_never_success(self):
+        for text in ("", "x", "# 日报\n", "<!-- daily-report:status=ok", "<!-- 别的注释 -->\n"):
+            self.assertIsNone(report_status.read_status(text), text)
+            self.assertTrue(report_status.is_degraded(text), text)
+
+    def test_body_drops_only_the_marker_line(self):
+        marked = report_status.marker(report_status.OK) + "\n# 标题\n\n正文\n"
+        self.assertEqual("# 标题\n\n正文\n", report_status.body(marked))
+        self.assertEqual("# 没有标记\n", report_status.body("# 没有标记\n"))
+
+    def test_read_head_of_a_missing_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual("", report_status.read_head(Path(directory) / "nope.md"))
+
+
+class DailyReportDegradedExitTests(unittest.TestCase):
+    """模型失败时 daily_report.py 必须给出非零码，否则 service.py 当成今天已完成。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports = root / "reports"
+        self.reports.mkdir()
+        cache = root / "topics.json"
+        cache.write_text(json.dumps([
+            {"id": "1", "title": "Sonnet 5.5 上线", "category": "前沿快讯", "author": "a",
+             "views": 1500, "replies": 10, "like_count": 5,
+             "created_at": "2026-09-29T02:00:00.000Z"},
+        ]), encoding="utf-8")
+        contents = root / "content.json"
+        contents.write_text(json.dumps({"1": {"content": "正文"}}), encoding="utf-8")
+        hot = root / "hot.json"
+        hot.write_text(json.dumps({"daily": [], "weekly": []}), encoding="utf-8")
+        self.patches = [
+            patch.object(report, "CACHE_FILE", str(cache)),
+            patch.object(report, "CONTENT_FILE", str(contents)),
+            patch.object(report, "HOT_FILE", str(hot)),
+            patch.object(report, "REPORT_DIR", str(self.reports)),
+            patch.object(report, "read_api_key", return_value="sk-test"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in self.patches:
+            item.stop()
+        self.tmp.cleanup()
+
+    def run_main(self, argv):
+        with patch.object(sys, "argv", ["daily_report.py"] + argv):
+            return report.main()
+
+    def written(self):
+        return self.reports / "AI日报-2026-09-29.md"
+
+    def test_llm_failure_writes_degraded_marker_and_exits_nonzero(self):
+        pushed = []
+        error = urllib.error.HTTPError("https://gw.test/v1", 403, "Forbidden", {}, None)
+        with patch.object(report, "call_llm", side_effect=error), \
+             patch.object(report, "push_chat", side_effect=lambda *a, **k: pushed.append(a)), \
+             patch.object(report, "push_card", side_effect=lambda *a, **k: pushed.append(a)):
+            code = self.run_main(["--date", "2026-09-29", "--push-chat", "oc_test"])
+
+        text = self.written().read_text(encoding="utf-8")
+        self.assertEqual(report_status.EXIT_DEGRADED, code)
+        self.assertEqual((report_status.DEGRADED, "llm_failed"), report_status.read_status(text))
+        self.assertIn("模型调用失败", text)
+        self.assertEqual([], pushed, "降级日报不该被推到飞书")
+        self.assertNotIn(report_status.marker(report_status.OK), text)
+
+    def test_missing_credentials_degrade(self):
+        with patch.object(report, "read_api_key", return_value=""):
+            code = self.run_main(["--date", "2026-09-29"])
+
+        text = self.written().read_text(encoding="utf-8")
+        self.assertEqual(report_status.EXIT_DEGRADED, code)
+        self.assertEqual((report_status.DEGRADED, "no_credentials"), report_status.read_status(text))
+
+    def test_successful_llm_writes_ok_marker_and_exits_zero(self):
+        with patch.object(report, "call_llm", return_value=("## ⚡ 高价值信息\n\n有内容\n", {})):
+            code = self.run_main(["--date", "2026-09-29"])
+
+        text = self.written().read_text(encoding="utf-8")
+        self.assertEqual(0, code)
+        self.assertEqual((report_status.OK, ""), report_status.read_status(text))
+        self.assertFalse(report_status.is_degraded(text))
+        self.assertTrue(text.startswith(report_status.marker(report_status.OK)))
+
+    def test_no_llm_is_an_explicit_choice_not_a_degradation(self):
+        """--no-llm 是运维明说要统计版，不算降级；否则每天都会被当成失败重试。"""
+        code = self.run_main(["--date", "2026-09-29", "--no-llm"])
+
+        text = self.written().read_text(encoding="utf-8")
+        self.assertEqual(0, code)
+        self.assertEqual((report_status.OK, ""), report_status.read_status(text))
+
+    def test_report_is_written_atomically_and_replaces_the_previous_one(self):
+        """原子写：并发读者不该看到半截文件（旧版直接 open(path,"w") 截断再写）。"""
+        self.written().write_text("旧版本内容", encoding="utf-8")
+        with patch.object(report, "call_llm", return_value=("## ⚡ 高价值信息\n\n新内容\n", {})):
+            code = self.run_main(["--date", "2026-09-29"])
+
+        text = self.written().read_text(encoding="utf-8")
+        self.assertEqual(0, code)
+        self.assertNotIn("旧版本内容", text)
+        self.assertIn("新内容", text)
+        self.assertEqual([], list(self.reports.glob("*.tmp")), "临时文件必须已被 os.replace 掉")
 
 
 class ServiceImageTests(unittest.TestCase):

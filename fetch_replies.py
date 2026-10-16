@@ -27,36 +27,17 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+from common import PROXY_DEFAULT, load_json, log, write_json_atomic
+
 BASE = "https://linux.do"
-PROXY_DEFAULT = os.environ.get("LINUXDO_PROXY", "")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
 CACHE_FILE = os.path.join(DATA_DIR, "linuxdo_topics.json")
 REPLIES_FILE = os.path.join(DATA_DIR, "topic_replies.json")
-
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
-
-
-def kill_stale_chrome():
-    """清理以 browser_data 为 profile 的残留 Chrome（会锁住登录态）"""
-    for pat in ("browser_data",):
-        try:
-            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-            for pid in r.stdout.split():
-                try:
-                    os.kill(int(pid), 15)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    time.sleep(2)
 
 
 def start_browser(proxy=None, headless=False, offscreen=True):
@@ -170,21 +151,6 @@ def fetch_replies(pg, row, max_pages=5, page_pause=(2.5, 5.0)):
     }
 
 
-def load_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json(path, obj):
-    temporary = f"{path}.tmp"
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(temporary, path)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true", help="缓存里全部帖子（量大）")
@@ -252,7 +218,6 @@ def main():
         log("没有需要抓取的帖子")
         return
 
-    kill_stale_chrome()
 
     def spin_up():
         return start_browser(proxy=None if args.no_proxy else PROXY_DEFAULT,
@@ -301,7 +266,6 @@ def main():
                     except Exception:  # noqa: BLE001
                         pass
                     time.sleep(5)
-                    kill_stale_chrome()
                     ctx, pg = spin_up()
                     log("  浏览器已重建，继续")
                     break
@@ -317,13 +281,13 @@ def main():
             elif not rebuilt_this:
                 fail += 1
             if ok % 5 == 0 or (i + 1) % 20 == 0:
-                save_json(REPLIES_FILE, replies)
+                write_json_atomic(REPLIES_FILE, replies)
                 log(f"  进度 {i+1}/{len(todo)}，成功 {ok}，失败 {fail}，"
                     f"回复累计 {total_replies}，429 {rate_hits}，重建 {rebuilds}")
             if (i + 1) % 20 == 0:
-                save_json(REPLIES_FILE, replies)
+                write_json_atomic(REPLIES_FILE, replies)
     finally:
-        save_json(REPLIES_FILE, replies)
+        write_json_atomic(REPLIES_FILE, replies)
         try:
             ctx.close()
         except Exception:  # noqa: BLE001
