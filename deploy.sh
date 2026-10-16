@@ -12,8 +12,18 @@ done
 cp -Rp reports "$BK/reports"
 echo "== backup =="
 ls -la "$BK"
-echo "== discard local mods (content already committed in 6118cf4) =="
-git checkout -- .
+echo "== 工作区必须是干净的：脏了就停，不猜也不丢 =="
+# 原写法是 `git checkout -- .`（注释写「content already committed in 6118cf4」）。
+# 它在这里做两件坏事：一是把未提交的改动直接抹掉 —— 上面 9–11 行的备份只覆盖写死的
+# 那几个文件，改了清单外的 tracked 文件就**没有备份**地没了；二是它恰好拆掉了 git 自己
+# 的安全网 —— `git merge --ff-only` 本来会因为「会覆盖本地改动」而拒绝执行，被它清干净
+# 后就照常快进了。脏工作区是「有人正在改东西」的信号，怎么处理该由人决定。
+# untracked 不算脏（data/ 与 reports/ 下的产物常年在），故判据加 --untracked-files=no。
+if [ -n "$(git status --porcelain=v1 --untracked-files=no)" ]; then
+  echo "FATAL: 工作区有未提交的 tracked 改动，deploy 拒绝覆盖。请先 commit / stash 后重跑：" >&2
+  git status --porcelain=v1 --untracked-files=no >&2
+  exit 1
+fi
 
 echo "== fast-forward main -> delivered revision =="
 # --- 落地目标：按 commit 钉死（POLL-77）---
