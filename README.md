@@ -206,9 +206,9 @@ python service.py --once
 | `SCRAPE_CONTENT` | `false` | 是否抓取新帖正文（存入正文缓存，并随该行一起写入飞书） |
 | `SCRAPE_CONTENT_LIMIT` | `0` | 单轮最多抓 N 条正文；0 = 不限。建议设为几百，避免大轮次把 `SCRAPE_TIMEOUT_SECONDS` 耗尽 |
 | `SCRAPE_HOT` | browser 模式默认 `true` | 是否同时抓官方热榜（1 次请求）写入 `data/hot_topics.json`。**在 `rss` 模式下无效**：`--hot` 只在 browser 模式传给抓取器（`command()` 里 `mode == "browser"` 才追加） |
-| `LINUXDO_PROXY` | 空 | 可选 HTTP 代理 |
+| `LINUXDO_PROXY` | 空 | 可选 HTTP 代理。**本机直连 `linux.do` 会被拦（连接超时 / SSL 重置）时必须设**，否则每轮 RSS 全部失败；本机 Clash 混合端口为 `http://127.0.0.1:7897` |
 | `PUSH_TO_FEISHU` | `false` | 抓取后自动调用本机 `lark-cli` 写入飞书 |
-| `LARK_PROFILE` | `claw` | 飞书 `lark-cli` 配置名 |
+| `LARK_PROFILE` | `feishu-work` | 飞书 `lark-cli` 配置名（须是创建该 Base 的 app `cli_aa0112b836bf5be2`；旧名 `claw` 已不存在，用错会 `profile not found` 并让整轮失败） |
 | `FEISHU_ID_CACHE_SECONDS` | `86400` | 飞书 Topic ID 本地索引有效期，避免每轮扫全表 |
 | `DAILY_REPORT` | `false` | 是否每天生成一份 AI 日报到 `reports/`（每天只生成一次，靠当天文件去重） |
 | `DAILY_REPORT_HOUR` | `8` | 当天几点之后才允许生成日报 |
@@ -368,7 +368,9 @@ browser 模式必须在**图形会话**中运行（launchd 用户代理满足这
   <key>SCRAPE_MODE</key><string>browser</string>
   <key>SCRAPE_INTERVAL_SECONDS</key><string>21600</string>
   <key>PUSH_TO_FEISHU</key><string>true</string>
-  <key>LARK_PROFILE</key><string>claw</string>
+  <key>LARK_PROFILE</key><string>feishu-work</string>
+  <!-- 本机直连 linux.do 会被拦；Clash 混合端口 7897 作为出口 -->
+  <key>LINUXDO_PROXY</key><string>http://127.0.0.1:7897</string>
   <key>SERVICE_TOKEN</key><string>你的随机令牌</string>
   <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 </dict>

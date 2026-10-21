@@ -62,10 +62,12 @@ def sanitize_rows(rows):
         out.append(r)
     return out, patched
 
-# 关键：必须用创建该 Base 的 app profile（claw / cli_aa0112b836bf5be2）。
-# 默认 active profile 是 huidu（cli_aa20b02703b99d18），对这张表无权限（91403）。
-# 命名 profile 见 ~/.lark-cli/config.json（config init --name claw）。
-LARK_PROFILE = os.environ.get("LARK_PROFILE", "claw")
+# 关键：必须用创建该 Base 的 app profile（feishu-work / cli_aa0112b836bf5be2）。
+# 默认 active profile 若是别的 app（如 cli_aa20b02703b99d18），对这张表无权限（91403）。
+# 2026-10-22：本机 lark-cli 里旧名 claw 已不存在，同一 appId 的 profile 现名 feishu-work；
+# 写死 claw 会让 push 阶段报 `profile "claw" not found`，整轮按失败收口。
+# 命名 profile 见 ~/.lark-cli/config.json（lark-cli profile list）。
+LARK_PROFILE = os.environ.get("LARK_PROFILE", "feishu-work")
 CACHE_FILE = Path(__file__).resolve().parent / "data" / "feishu_topic_ids.json"
 REJECT_FILE = Path(__file__).resolve().parent / "data" / "rejected_topics.json"
 CONTENT_FILE = Path(__file__).resolve().parent / "data" / "topic_content.json"
