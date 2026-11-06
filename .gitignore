@@ -71,3 +71,6 @@ exports/
 reports/AI日报-*.md
 reports/帖子清单-*.md
 draft_*_folder/
+
+# Local runtime and generated files excluded from source archives
+data/*.bak*
